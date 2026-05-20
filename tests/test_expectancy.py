@@ -1,0 +1,127 @@
+"""
+tests/test_expectancy.py
+=====================================================================
+ExpectancyAnalyzer 단위 테스트 — 3개 시나리오.
+
+근거: docs/SPEC_v3.1.md §8-4 (ExpectancyAnalyzer 의존성)
+
+구성:
+  - DB는 tmp_path 임시 SQLite (db.init_db.init_db로 schema.sql + v3.1.1 적용)
+  - trades 테이블에 가상 거래 삽입 후 집계 검증
+
+3개 시나리오 expected:
+  1. 거래 10건 (승 6 R=2.0 / 패 4 R=-1.0)
+     → trade_count=10, win_rate=0.6, avg_R≈0.8, expectancy_R≈0.8, total_pnl=40
+  2. 거래 0건 → default Stats (모든 필드 0)
+  3. setup_tag별 분리 → TREND_PULLBACK 5건, RANGING_MR 3건
+=====================================================================
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from datetime import datetime, timezone
+
+import pytest
+
+from analytics.expectancy import ExpectancyAnalyzer, Stats
+from db.init_db import init_db
+
+
+# ── fixtures / helpers ──────────────────────────────────────────────
+
+@pytest.fixture
+def db_path(tmp_path) -> str:
+    """schema.sql + v3.1.1 마이그레이션이 적용된 임시 DB 경로."""
+    p = tmp_path / "bot.db"
+    init_db(p)
+    return str(p)
+
+
+def _insert_trade(
+    conn: sqlite3.Connection,
+    *,
+    action: str = "LONG",
+    entry: float = 100.0,
+    exit_price: float = 102.0,
+    stop: float = 99.0,
+    net_pnl: float = 10.0,
+    setup_tag: str = "TREND_PULLBACK",
+    regime: str = "TREND_UP",
+) -> None:
+    """닫힌 거래 1건 삽입 (timestamp = 현재 UTC ISO)."""
+    ts = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT INTO trades "
+        "(timestamp, symbol, action, entry_price, exit_price, quantity, "
+        " stop_loss, pnl_usd, pnl_usd_net, setup_tag, regime) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (ts, "SOLUSDT", action, entry, exit_price, 1.0,
+         stop, net_pnl, net_pnl, setup_tag, regime),
+    )
+
+
+# ── 시나리오 1: 10건 (승 6 / 패 4) → 통계 정확 ─────────────────────
+
+def test_scenario_1_overall_stats(db_path):
+    conn = sqlite3.connect(db_path)
+    try:
+        # 승 6건: LONG entry=100, stop=99 (risk=1), exit=102 (reward=2) → R=2.0
+        for _ in range(6):
+            _insert_trade(conn, exit_price=102.0, net_pnl=10.0)
+        # 패 4건: LONG entry=100, stop=99 (risk=1), exit=99 (reward=-1) → R=-1.0
+        for _ in range(4):
+            _insert_trade(conn, exit_price=99.0, net_pnl=-5.0)
+        conn.commit()
+    finally:
+        conn.close()
+
+    stats = ExpectancyAnalyzer(db_path).overall(days=7)
+
+    assert isinstance(stats, Stats)
+    assert stats.trade_count == 10
+    assert stats.win_rate == pytest.approx(0.6)
+    # avg_R = (6*2.0 + 4*(-1.0)) / 10 = 0.8
+    assert stats.avg_R == pytest.approx(0.8)
+    assert stats.expectancy_R == pytest.approx(0.8)
+    # total_pnl = 6*10 + 4*(-5) = 40
+    assert stats.total_pnl_usdt == pytest.approx(40.0)
+
+
+# ── 시나리오 2: 거래 0건 → default Stats ──────────────────────────
+
+def test_scenario_2_empty_returns_default(db_path):
+    stats = ExpectancyAnalyzer(db_path).overall(days=7)
+
+    assert isinstance(stats, Stats)
+    assert stats.trade_count == 0
+    assert stats.win_rate == 0.0
+    assert stats.avg_R == 0.0
+    assert stats.expectancy_R == 0.0
+    assert stats.total_pnl_usdt == 0.0
+
+
+# ── 시나리오 3: setup_tag별 분리 ──────────────────────────────────
+
+def test_scenario_3_by_setup_split(db_path):
+    conn = sqlite3.connect(db_path)
+    try:
+        # TREND_PULLBACK 5건
+        for _ in range(5):
+            _insert_trade(conn, setup_tag="TREND_PULLBACK", exit_price=102.0, net_pnl=10.0)
+        # RANGING_MR 3건
+        for _ in range(3):
+            _insert_trade(conn, setup_tag="RANGING_MR", exit_price=99.0, net_pnl=-5.0)
+        conn.commit()
+    finally:
+        conn.close()
+
+    by_setup = ExpectancyAnalyzer(db_path).by_setup(days=7)
+
+    assert len(by_setup) == 2
+    by_tag = {s.setup_tag: s for s in by_setup}
+    assert set(by_tag) == {"TREND_PULLBACK", "RANGING_MR"}
+    assert by_tag["TREND_PULLBACK"].trade_count == 5
+    assert by_tag["TREND_PULLBACK"].win_rate == pytest.approx(1.0)
+    assert by_tag["RANGING_MR"].trade_count == 3
+    assert by_tag["RANGING_MR"].win_rate == pytest.approx(0.0)

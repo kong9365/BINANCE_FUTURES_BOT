@@ -1,0 +1,229 @@
+"""
+tests/test_backtest_engine.py
+=====================================================================
+BacktestEngine 단위 테스트 — 명세서 §10 Phase 0 백테스트 검증.
+
+  1. 인위적 상승추세 (+0.5%/봉) → 레짐 TREND_UP 분류, 양의 수익 (비용 차감 후)
+  2. 인위적 하락추세 (-0.5%/봉) → 레짐 TREND_DOWN 분류, SHORT 거래로 양의 수익
+  3. 인위적 횡보 (±0.1% 변동)   → 레짐 RANGING 분류, 무거래, 수익 ≈ 0
+  4. 룩어헤드 차단 검증:
+     (a) _get_candles_until() 반환값은 항상 ts < cur_ts (현재 봉 제외)
+     (b) prefix 불변성 — 뒤에 봉을 추가해도 그 전에 청산 완료된 거래의
+         자본 곡선은 완전히 동일 (가장 견고한 룩어헤드 검증)
+
+타임프레임 명시:
+  task 명세의 "BTCUSDT 30일 daily candle"을, RegimeDetector 의 EMA(period+2=22봉)
+  /ADX(15봉)/atr_ratio(34봉) 워밍업 + 안정성 룰(3봉 연속) 확보를 위해
+  120 daily 봉(봉 간격 1일)으로 확장한다. 이는 결정의 견고성을 위한 확장이며
+  +0.5%/봉, -0.5%/봉, ±0.1% 변동이라는 시나리오 본질은 동일하다.
+
+가짜 캔들은 make_candles()로 결정론적 생성 (random 미사용, 재현 가능).
+외부 호출 없음 (Binance/OpenAI mock 불필요 — 엔진은 순수 계산).
+=====================================================================
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+
+import pandas as pd
+
+from backtesting.backtest_engine import BacktestConfig, BacktestEngine
+
+
+# ── 결정론적 캔들 생성 헬퍼 ──
+TS0 = datetime(2023, 1, 1, tzinfo=timezone.utc)
+INTERVAL = timedelta(days=1)
+
+
+def make_candles(direction, n=120, base_price=50000.0, atr_pct=0.5):
+    """방향성 일봉 캔들을 결정론적으로 생성 → pandas DataFrame.
+
+    index   = UTC tz-aware DatetimeIndex (1일 간격)
+    columns = [open, high, low, close, volume, funding_rate]
+
+    Args:
+        direction: "up" | "down" | "sideways"
+          - "up"       : 매 봉 +step 상승 (ADX≈100, EMA 기울기 양수 → TREND_UP)
+          - "down"     : 매 봉 -step 하락 (→ TREND_DOWN)
+          - "sideways" : 진폭이 점차 축소되는 횡보 (ADX≈20, BB폭≈0, atr_ratio<0.9
+                         → RANGING)
+        n: 봉 개수.
+        base_price: 기준 시작가.
+        atr_pct: 봉당 종가 이동폭 (% of base_price).
+
+    Returns:
+        pandas.DataFrame.
+    """
+    step = base_price * atr_pct / 100.0
+    rows = []
+    index = []
+    price = base_price
+    for i in range(n):
+        ts = TS0 + i * INTERVAL
+        if direction == "up":
+            o = price
+            c = price + step
+            h = c + step * 0.15
+            l = o - step * 0.15
+            price = c
+        elif direction == "down":
+            o = price
+            c = price - step
+            h = o + step * 0.15
+            l = c - step * 0.15
+            price = c
+        elif direction == "sideways":
+            # 진폭이 i에 따라 선형 축소 → 최근 ATR < 과거 ATR → atr_ratio < 1
+            amp = step * 0.2 * (1.0 - 0.7 * i / max(1, n - 1))
+            sign = 1.0 if i % 2 == 0 else -1.0
+            o = base_price
+            c = base_price + sign * amp * 0.1
+            h = base_price + amp
+            l = base_price - amp
+        else:
+            raise ValueError(f"unknown direction: {direction}")
+        rows.append((o, h, l, c, 1000.0, 0.0))
+        index.append(ts)
+
+    return pd.DataFrame(
+        rows,
+        index=pd.DatetimeIndex(index),
+        columns=["open", "high", "low", "close", "volume", "funding_rate"],
+    )
+
+
+def _default_config():
+    """BTCUSDT 단일 페어 기본 BacktestConfig."""
+    return BacktestConfig(pairs=["BTCUSDT"])
+
+
+# ── 시나리오 1: 상승추세 → TREND_UP, 양의 수익 ──
+def test_scenario_1_uptrend_trend_up_positive_return():
+    candles = make_candles("up", n=120, atr_pct=0.5)
+    engine = BacktestEngine(_default_config())
+    result = engine.run({"BTCUSDT": candles})
+
+    # 레짐이 TREND_UP 으로 분류됨
+    assert "TREND_UP" in result.regime_stats
+    assert result.regime_stats["TREND_UP"]["bars"] > 0
+
+    # 거래가 발생함
+    assert result.total_trades > 0
+
+    # LONG 셋업만 발생 (상승추세이므로)
+    assert set(result.setup_stats.keys()) == {"trend_follow_long"}
+
+    # 비용 차감 후에도 양의 수익
+    assert result.total_return_pct > 0
+
+    # 일관된 상승추세 → 승률 매우 높음 (권장 tolerance ≥ 0.85)
+    assert result.win_rate >= 0.85
+
+    # 자본 곡선은 매 봉 1포인트
+    assert len(result.equity_curve) == len(candles)
+    assert len(result.drawdown_curve) == len(candles)
+
+
+# ── 시나리오 2: 하락추세 → TREND_DOWN, SHORT 거래로 양의 수익 ──
+def test_scenario_2_downtrend_trend_down_short_positive_return():
+    candles = make_candles("down", n=120, atr_pct=0.5)
+    engine = BacktestEngine(_default_config())
+    result = engine.run({"BTCUSDT": candles})
+
+    # 레짐이 TREND_DOWN 으로 분류됨
+    assert "TREND_DOWN" in result.regime_stats
+    assert result.regime_stats["TREND_DOWN"]["bars"] > 0
+
+    # 거래가 발생하고 SHORT 셋업만 존재
+    assert result.total_trades > 0
+    assert set(result.setup_stats.keys()) == {"trend_follow_short"}
+
+    # SHORT 거래로 비용 차감 후에도 양의 수익
+    assert result.total_return_pct > 0
+    assert result.win_rate >= 0.85
+
+
+# ── 시나리오 3: 횡보 → RANGING, 무거래, 수익 ≈ 0 ──
+def test_scenario_3_ranging_no_trades_zero_return():
+    candles = make_candles("sideways", n=120)
+    engine = BacktestEngine(_default_config())
+    result = engine.run({"BTCUSDT": candles})
+
+    # 레짐이 RANGING 으로 분류됨 (워밍업 후)
+    assert "RANGING" in result.regime_stats
+    assert result.regime_stats["RANGING"]["bars"] > 0
+
+    # 횡보 레짐은 무거래 → 거래 0건, 수익 정확히 0
+    assert result.total_trades == 0
+    assert result.total_return_pct == 0.0
+    assert result.setup_stats == {}
+
+    # 자본 곡선은 시종 initial_capital 유지
+    assert all(
+        v == result.config.initial_capital for _, v in result.equity_curve
+    )
+
+
+# ── 시나리오 4-a: _get_candles_until() 은 현재 봉을 절대 포함하지 않음 ──
+def test_scenario_4a_get_candles_until_excludes_current_bar():
+    df = make_candles("up", n=10)
+    engine = BacktestEngine(_default_config())
+    # run() 없이 슬라이스 메서드만 직접 검증
+    engine._candles_by_pair = {"BTCUSDT": df}
+    idx = df.index
+
+    # 기존 인덱스값을 cur_ts 로 주면 그 봉(및 이후)은 모두 제외
+    cur = idx[5]
+    candles = engine._get_candles_until("BTCUSDT", "4h", cur)
+    assert len(candles) == 5
+    assert all(c[5] < cur for c in candles), "현재/미래 봉이 누설됨 — 룩어헤드 버그"
+
+    # 마지막 인덱스 → 마지막 봉 1개 제외 (n-1개)
+    candles_last = engine._get_candles_until("BTCUSDT", "4h", idx[-1])
+    assert len(candles_last) == len(df) - 1
+    assert all(c[5] < idx[-1] for c in candles_last)
+
+    # 모든 데이터보다 이후의 ts → 전체 봉 반환
+    after_all = idx[-1] + INTERVAL
+    assert len(engine._get_candles_until("BTCUSDT", "4h", after_all)) == len(df)
+
+    # 모든 데이터보다 이전의 ts → 빈 리스트
+    before_all = idx[0] - INTERVAL
+    assert engine._get_candles_until("BTCUSDT", "4h", before_all) == []
+
+
+# ── 시나리오 4-b: prefix 불변성 — 미래 봉 추가가 과거 결과를 바꾸지 않음 ──
+def test_scenario_4b_prefix_invariance_no_lookahead():
+    """전체 데이터로 돌린 백테스트와, 앞부분만 잘라 돌린 백테스트를 비교한다.
+
+    엔진이 미래 데이터를 일절 참조하지 않는다면, 잘린 지점보다 충분히 이전에
+    청산이 끝난 구간의 자본 곡선은 두 실행에서 완전히 동일해야 한다.
+    (시간 스톱 최대 보유 24봉을 감안해 30봉 마진을 둔다.)
+    """
+    full = make_candles("up", n=120, atr_pct=0.5)
+    prefix_len = 90
+    prefix = full.iloc[:prefix_len]
+
+    result_full = BacktestEngine(_default_config()).run({"BTCUSDT": full})
+    result_prefix = BacktestEngine(_default_config()).run({"BTCUSDT": prefix})
+
+    # 잘린 지점(index 89)에서 30봉 마진 → cutoff = index 60
+    cutoff = full.index[60]
+
+    full_eq = {ts: v for ts, v in result_full.equity_curve if ts <= cutoff}
+    prefix_eq = {ts: v for ts, v in result_prefix.equity_curve if ts <= cutoff}
+
+    # 비교 대상 타임스탬프 집합이 같아야 함
+    assert full_eq.keys() == prefix_eq.keys()
+    assert len(full_eq) > 0
+
+    # 테스트가 무의미하지 않도록 — 실제로 거래가 발생했어야 함
+    assert result_full.total_trades > 0
+
+    # cutoff 이전 구간 자본 곡선은 완전히 동일 (룩어헤드 0)
+    for ts in full_eq:
+        assert abs(full_eq[ts] - prefix_eq[ts]) < 1e-9, (
+            f"룩어헤드 의심: {ts} 시점 자본이 미래 데이터 유무에 따라 달라짐 "
+            f"(full={full_eq[ts]}, prefix={prefix_eq[ts]})"
+        )

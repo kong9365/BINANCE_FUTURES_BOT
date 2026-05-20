@@ -1,0 +1,49 @@
+# =====================================================================
+# Binance Futures Bot v3.1 — Python Dependencies
+# Python 3.10+ required
+# =====================================================================
+
+# ── Binance API ──
+python-binance>=1.0.19        # REST + WebSocket
+aiohttp>=3.9.0                # 비동기 HTTP (python-binance 의존)
+
+# ── OpenAI (주간 분석 전용) ──
+openai>=1.30.0                # gpt-4o-mini 호출
+
+# ── 데이터 처리 ──
+pandas>=2.0.0
+numpy>=1.24.0
+pyyaml>=6.0                   # config/macro_events.yaml
+
+# ── 기술적 지표 (선택, 직접 구현 권장) ──
+# pandas-ta>=0.3.14b0         # 명세서는 자체 구현 사용. 검증 비교용으로만.
+
+# ── Telegram 알림 ──
+python-telegram-bot>=20.0
+
+# ── 백테스트 시각화 ──
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# ── 환경 변수 ──
+python-dotenv>=1.0.0
+
+# ── 테스트 ──
+pytest>=7.4.0
+pytest-asyncio>=0.23.0
+pytest-cov>=4.1.0
+pytest-mock>=3.12.0
+
+# ── 코드 품질 (선택) ──
+ruff>=0.4.0                   # lint + format (flake8/black 대체)
+mypy>=1.8.0                   # 타입 체크 (선택적)
+
+# ── 로깅·운영 ──
+structlog>=24.1.0             # 구조화 로깅 (선택)
+
+# ── 옵션: CoinMarketCap (PairWhitelist용) ──
+# coinmarketcap>=5.0.3
+# requests>=2.31.0
+
+# ── 옵션: 시간 동기 검증 ──
+ntplib>=0.4.0                 # NTP 시간 차이 측정 (SystemHealthMonitor 보조)

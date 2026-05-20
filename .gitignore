@@ -1,0 +1,134 @@
+# =====================================================================
+# Binance Futures Bot v3.1 — .gitignore
+# =====================================================================
+
+# ── 비밀 / 환경 변수 (절대 커밋 금지) ──
+.env
+.env.local
+.env.production
+.env.*.local
+*.key
+*.pem
+secrets/
+.envrc
+
+# ── 데이터베이스 ──
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+data/*.sqlite
+data/*.sqlite3
+*.dump
+
+# ── 백업 ──
+backups/
+data/backup/
+
+# ── 로그 ──
+logs/
+*.log
+*.log.*
+
+# ── 백테스트 결과 (대용량) ──
+backtests/*/trades.csv
+backtests/*/equity_curve.csv
+backtests/*/*.parquet
+backtests/cache/
+# 단, 요약 결과는 보관 가능
+!backtests/*/summary.json
+!backtests/*/config.json
+!backtests/*/verdict.md
+
+# ── GPT 보고서 (개인 정보 가능성) ──
+reports/*.json
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ── 가상환경 ──
+venv/
+ENV/
+env/
+.venv/
+.python-version
+
+# ── 테스트·커버리지 ──
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.ruff_cache/
+.mypy_cache/
+.dmypy.json
+
+# ── IDE ──
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Jupyter ──
+.ipynb_checkpoints/
+*.ipynb
+
+# ── 일시적 파일 ──
+*.tmp
+*.bak
+*.orig
+*.rej
+scratch/
+tmp/
+
+# ── 캐시 ──
+.cache/
+.local/
+
+# ── Claude Code 관련 ──
+# CLAUDE.md는 공유 — 커밋 OK
+# CLAUDE.local.md는 개인 노트 — 미커밋
+CLAUDE.local.md
+.claude/
+
+# ── OS ──
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/

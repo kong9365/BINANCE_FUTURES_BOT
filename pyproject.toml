@@ -1,0 +1,127 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "binance-futures-bot"
+version = "3.1.0"
+description = "Binance USDT-M Futures 단타 자동매매 봇 (학술 데이터 기반 보수적 설계)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [
+    { name = "Your Name" }
+]
+keywords = ["binance", "futures", "trading", "crypto", "algorithmic-trading"]
+
+[project.urls]
+"Specification" = "docs/SPEC_v3.1.md"
+
+# ─────────────────────────────────────────────────────
+# pytest 설정
+# ─────────────────────────────────────────────────────
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+asyncio_mode = "auto"
+addopts = [
+    "-v",
+    "--strict-markers",
+    "--tb=short",
+    "--showlocals",
+]
+markers = [
+    "slow: 느린 테스트 (백테스트 등)",
+    "integration: 외부 의존성 있는 통합 테스트",
+    "network: 실제 네트워크 호출 필요",
+]
+filterwarnings = [
+    "error",
+    "ignore::DeprecationWarning:binance.*",
+    "ignore::DeprecationWarning:websockets.*",
+]
+
+# ─────────────────────────────────────────────────────
+# Ruff (lint + format)
+# ─────────────────────────────────────────────────────
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+extend-exclude = [
+    "venv",
+    "build",
+    "dist",
+    "backtests",
+    "reports",
+    "logs",
+    "data",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "C4",   # flake8-comprehensions
+    "UP",   # pyupgrade
+    "RUF",  # ruff-specific
+]
+ignore = [
+    "E501",   # line too long (formatter가 처리)
+    "B008",   # function call in default argument (dataclass field 등)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402", "F401"]
+"__init__.py" = ["F401"]
+
+# ─────────────────────────────────────────────────────
+# Mypy (선택)
+# ─────────────────────────────────────────────────────
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = false
+warn_unused_configs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true
+check_untyped_defs = true
+exclude = [
+    "venv",
+    "build",
+    "tests/test_.*",
+]
+
+# ─────────────────────────────────────────────────────
+# Coverage
+# ─────────────────────────────────────────────────────
+[tool.coverage.run]
+branch = true
+source = [
+    "strategy",
+    "sizing",
+    "analytics",
+    "ops",
+    "trading",
+    "data",
+    "backtesting",
+    "config",
+]
+omit = [
+    "*/tests/*",
+    "*/__init__.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]

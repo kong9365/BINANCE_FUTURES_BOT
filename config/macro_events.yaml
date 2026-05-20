@@ -1,0 +1,89 @@
+# config/macro_events.yaml
+# =====================================================================
+# 거시 이벤트 캘린더 (SPEC §8-5-3)
+#
+# MacroEventAnalyzer가 로드. 이벤트 ±N분 윈도우 시 신규 진입 차단.
+#   - HIGH:   ±120분 (FOMC, CPI, ETF 결정)
+#   - MEDIUM: ±60분  (NFP, PCE, GDP, 옵션 만기)
+#   - LOW:    ±30분  (기타)
+#
+# event_time_utc 는 UTC 기준 ISO8601 (tz 표기 없음, 코드에서 UTC로 해석).
+# affected_pairs 비워두면 모든 페어에 적용.
+#
+# 아래 이벤트는 작성 시점(2026-05-14) 기준 향후 90일 주요 일정.
+# 시각 환산: 미국 동부 여름시간(EDT, UTC-4) → UTC.
+#   · BLS 발표 08:30 ET  = 12:30 UTC
+#   · FOMC 성명 14:00 ET = 18:00 UTC
+#
+# 출처:
+#   · FOMC: Federal Reserve FOMC meeting calendar (federalreserve.gov)
+#   · CPI : BLS CPI release schedule (usinflationcalculator.com / cpiinflationcalculator.com)
+#   · NFP : BLS Employment Situation schedule (forexing.com, BLS schedule 확인)
+#           - 2026-07-02: 7/3 이 Independence Day(7/4 토요일) 대체공휴일 → 하루 앞당겨짐
+#   · Deribit 분기 옵션 만기: 분기말 마지막 금요일 08:00 UTC
+#
+# 운영자가 주기적으로 갱신 권장.
+# =====================================================================
+events:
+  - name: "US NFP (May)"
+    event_time_utc: "2026-06-05T12:30:00"
+    importance: "MEDIUM"
+    description: "5월 비농업부문 고용지표 (08:30 ET)"
+    affected_pairs: ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+    source: "manual"
+
+  - name: "US CPI (May)"
+    event_time_utc: "2026-06-10T12:30:00"
+    importance: "HIGH"
+    description: "5월 소비자물가지수 (08:30 ET)"
+    affected_pairs: ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+    source: "manual"
+
+  - name: "FOMC Statement"
+    event_time_utc: "2026-06-17T18:00:00"
+    importance: "HIGH"
+    description: "연방기금금리 결정 + 경제 전망(dot plot) (14:00 ET)"
+    affected_pairs: ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+    source: "manual"
+
+  - name: "Quarterly Options Expiry"
+    event_time_utc: "2026-06-26T08:00:00"
+    importance: "MEDIUM"
+    description: "Deribit 분기 옵션 만기 (분기말 마지막 금요일 08:00 UTC)"
+    affected_pairs: ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+    source: "manual"
+
+  - name: "US NFP (June)"
+    event_time_utc: "2026-07-02T12:30:00"
+    importance: "MEDIUM"
+    description: "6월 비농업부문 고용지표 (08:30 ET, 7/3 공휴일로 하루 앞당겨짐)"
+    affected_pairs: ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+    source: "manual"
+
+  - name: "US CPI (June)"
+    event_time_utc: "2026-07-14T12:30:00"
+    importance: "HIGH"
+    description: "6월 소비자물가지수 (08:30 ET)"
+    affected_pairs: ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+    source: "manual"
+
+  - name: "FOMC Statement"
+    event_time_utc: "2026-07-29T18:00:00"
+    importance: "HIGH"
+    description: "연방기금금리 결정 (14:00 ET)"
+    affected_pairs: ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+    source: "manual"
+
+  - name: "US NFP (July)"
+    event_time_utc: "2026-08-07T12:30:00"
+    importance: "MEDIUM"
+    description: "7월 비농업부문 고용지표 (08:30 ET)"
+    affected_pairs: ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+    source: "manual"
+
+  - name: "US CPI (July)"
+    event_time_utc: "2026-08-12T12:30:00"
+    importance: "HIGH"
+    description: "7월 소비자물가지수 (08:30 ET)"
+    affected_pairs: ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+    source: "manual"
