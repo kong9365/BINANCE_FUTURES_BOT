@@ -490,6 +490,94 @@ async def test_hedge_mode_critical_alert(bot):
     assert "SOLUSDT" not in bot.exit_plan.get_tracked()
 
 
+# ── Telegram 알림 강화 (16h 운영 모니터링) ──────────────────────────
+
+async def test_entry_and_protective_alerts_content(bot):
+    """진입 알림(요구4: trade_id/entry_order_id/notional) + 보호주문 알림(요구5)."""
+    bot.risk_manager.check_all = AsyncMock(return_value=True)
+    bot.executor.enter_trade = AsyncMock(return_value={
+        "success": True, "critical": False, "trade_id": 42,
+        "symbol": "SOLUSDT", "quantity": 0.5, "entry_price_actual": 150.0,
+        "entry_order_id": "bot-SOLUSDT-abc", "sl_order_id": "9001",
+        "tp_order_id": "9002", "reason": "ok",
+    })
+    bot.telegram.send.reset_mock()
+
+    await bot._handle_signal(_candidate("SOLUSDT"),
+                             _regime(Regime.TREND_UP, 0.8), _snapshot())
+
+    sent = [c.args[0] for c in bot.telegram.send.call_args_list]
+    entry_msg = next((m for m in sent if "✅ 진입" in m), None)
+    assert entry_msg is not None
+    assert "trade_id: 42" in entry_msg
+    assert "entry_order_id: bot-SOLUSDT-abc" in entry_msg
+    assert "notional:" in entry_msg
+    prot_msg = next((m for m in sent if "🛡️ 보호주문 등록" in m), None)
+    assert prot_msg is not None
+    assert "sl_order_id: 9001" in prot_msg
+    assert "tp_order_id: 9002" in prot_msg
+
+
+async def test_close_alert_includes_db_fields(bot, db_path):
+    """청산 알림에 exit_price/pnl_usd_net/duration_seconds/trade_status 포함(요구6)."""
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "INSERT INTO trades (timestamp, symbol, action, entry_price, quantity, "
+        "leverage, take_profit, stop_loss, exit_price, pnl_usd, pnl_usd_net, "
+        "duration_seconds, exit_reason, trade_status) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("2026-05-21T00:00:00+00:00", "SOLUSDT", "LONG", 100.0, 0.5, 3,
+         102.0, 99.0, 101.5, 0.75, 0.70, 123, "take_profit", "CLOSED"),
+    )
+    conn.commit(); conn.close()
+
+    msg = bot._close_alert_text("SOLUSDT", method="take_profit")
+    assert "exit_price: 101.5" in msg
+    assert "pnl_usd_net: 0.7" in msg
+    assert "duration_seconds: 123" in msg
+    assert "trade_status: CLOSED" in msg
+
+
+async def test_preflight_alert_pass_content(bot):
+    """preflight PASS 알림에 One-way / 공존 항목 수 / 비보호 0 명시(요구2)."""
+    bot.executor.preflight_open_position_symbols = AsyncMock(
+        return_value=["INJUSDT", "LYNUSDT"])
+    bot.executor.preflight_open_order_symbols = AsyncMock(return_value=["ETHUSDT"])
+    bot.executor.preflight_open_algo_symbols = AsyncMock(return_value=["INJUSDT"])
+    bot.telegram.send.reset_mock()
+
+    await bot._live_account_preflight()
+
+    sent = [c.args[0] for c in bot.telegram.send.call_args_list]
+    msg = next((m for m in sent if "Live Preflight PASS" in m), None)
+    assert msg is not None
+    assert "One-way Mode" in msg
+    assert "비보호종목 기존 포지션/주문/algo: 0건" in msg
+    # baseline 기록되어 heartbeat 불변 비교 가능
+    assert bot._protected_baseline is not None
+
+
+async def test_heartbeat_detects_protected_change_critical(bot):
+    """heartbeat 가 기존 보호종목 보유분 변경을 감지하면 CRITICAL 알림."""
+    bot.dry_run = False
+    bot.capital_manager.get_snapshot = AsyncMock(return_value=_snapshot())
+    bot._started_at = datetime.now(timezone.utc)
+    bot._protected_baseline = {
+        "positions": ["INJUSDT", "LYNUSDT"], "orders": ["ETHUSDT"],
+        "algos": ["INJUSDT"],
+    }
+    # INJUSDT 포지션이 사라짐 → 변경 감지
+    bot.executor.preflight_open_position_symbols = AsyncMock(return_value=["LYNUSDT"])
+    bot.executor.preflight_open_order_symbols = AsyncMock(return_value=["ETHUSDT"])
+    bot.executor.preflight_open_algo_symbols = AsyncMock(return_value=["INJUSDT"])
+    bot.telegram.send.reset_mock()
+
+    await bot._maybe_send_heartbeat()
+
+    sent = [c.args[0] for c in bot.telegram.send.call_args_list]
+    assert any("🚨 CRITICAL" in m and "보호종목 보유분 변경 감지" in m for m in sent)
+
+
 # ── 6c. reconcile_closed_positions 호출 (v3.1.2) ────────────────────
 
 async def test_manage_positions_reconciles_exchange_close(bot):
@@ -513,7 +601,8 @@ async def test_manage_positions_reconciles_exchange_close(bot):
     bot.executor.reconcile_closed_positions.assert_awaited_once()
     assert "SOLUSDT" not in bot.exit_plan.get_tracked()
     sent = [c.args[0] for c in bot.telegram.send.call_args_list]
-    assert any("거래소 청산 감지" in m and "SOLUSDT" in m for m in sent)
+    assert any("포지션 청산" in m and "SOLUSDT" in m and "reconcile" in m
+               for m in sent)
 
 
 # ── 7. 하트비트 (Telegram 주기 상태 알림) ───────────────────────────
@@ -533,8 +622,14 @@ async def test_heartbeat_sends_on_first_call(bot):
     hb = next((m for m in sent if "💓 하트비트" in m), None)
     assert hb is not None
     assert "DRY-RUN" in hb
-    assert "루프 횟수: 3" in hb
-    assert "직전 스캔 후보: 2" in hb
+    assert "루프: 3" in hb
+    assert "직전 스캔 2" in hb
+    # 강화된 heartbeat 필드 (요구 3)
+    assert "스캔 횟수:" in hb
+    assert "진입 시도/성공:" in hb
+    assert "ERROR/CRITICAL:" in hb
+    assert "DB:" in hb
+    assert "보호종목 기존 보유분:" in hb
     assert bot._last_heartbeat is not None
 
 

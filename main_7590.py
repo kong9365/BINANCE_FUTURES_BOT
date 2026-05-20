@@ -200,6 +200,25 @@ def _build_cmc_client():
         return None
 
 
+class _LevelCounter(logging.Handler):
+    """ERROR/CRITICAL 로그 발생 횟수를 누적한다(heartbeat 보고용).
+
+    root 로거에 부착되어 모든 모듈의 ERROR/CRITICAL 을 집계한다. 메시지 내용은
+    저장하지 않으므로(카운트만) 키/토큰 노출 위험이 없다.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.ERROR)
+        self.errors = 0
+        self.criticals = 0
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if record.levelno >= logging.CRITICAL:
+            self.criticals += 1
+        elif record.levelno >= logging.ERROR:
+            self.errors += 1
+
+
 # =====================================================================
 # MainBot
 # =====================================================================
@@ -375,6 +394,16 @@ class MainBot:
         self._last_heartbeat: datetime | None = None
         self._loop_count = 0
         self._last_candidate_count = 0
+        # ── 운영 통계 (heartbeat 보고용) ──
+        self._scan_count = 0
+        self._candidate_total = 0
+        self._entry_attempt_count = 0
+        self._entry_count = 0
+        # live preflight 시 기록하는 기존 보호종목 보유분 baseline (불변 비교용)
+        self._protected_baseline: dict[str, list[str]] | None = None
+        # ERROR/CRITICAL 로그 카운터 — root 로거에 부착
+        self._level_counter = _LevelCounter()
+        logging.getLogger().addHandler(self._level_counter)
 
         logger.info(
             "[MainBot] 초기화 완료 (dry_run=%s, db=%s, 보호종목=%s)",
@@ -449,8 +478,19 @@ class MainBot:
         except Exception as e:  # noqa: BLE001 — 프라이밍 실패해도 루프는 진행
             logger.warning("[Start] 데이터 신선도 프라이밍 실패: %s", e)
 
+        coexist_n = (
+            sum(len(v) for v in self._protected_baseline.values())
+            if self._protected_baseline else 0
+        )
         await self.telegram.send(
-            f"🚀 봇 가동 시작 (v3.1.1, {'DRY-RUN' if self.dry_run else 'LIVE'})"
+            f"🚀 봇 가동 시작 (v3.1.1, {'DRY-RUN' if self.dry_run else 'LIVE'})\n"
+            f"USE_TESTNET={getattr(self.collector, 'use_testnet', 'N/A')}\n"
+            f"DB: {self.db_path}\n"
+            f"신규거래 예산(cap): ${LIVE_PROBE_CONFIG.live_probe_budget_usdt:.0f}\n"
+            f"보호종목 {len(self.pair_wl.protected_symbols)}개: "
+            f"{', '.join(sorted(self.pair_wl.protected_symbols))}\n"
+            f"기존 보호종목 공존 항목: {coexist_n}건 (봇 비접근)\n"
+            f"비보호종목 기존 포지션/주문/algo: 0건"
         )
 
         # 8) 메인 루프
@@ -650,7 +690,9 @@ class MainBot:
             regime=regime_state.regime,
         )
         candidates = await self.oi_scanner.scan(active_pairs)
+        self._scan_count += 1
         self._last_candidate_count = len(candidates)
+        self._candidate_total += len(candidates)
 
         for candidate in candidates:
             await self._handle_signal(candidate, regime_state, capital_snapshot)
@@ -772,8 +814,10 @@ class MainBot:
             "available_at_entry": capital_snapshot.available_balance,
             "locked_margin_at_entry": capital_snapshot.locked_margin,
         }
+        self._entry_attempt_count += 1
         result = await self.executor.enter_trade(decision)
         if result.get("success"):
+            self._entry_count += 1
             # v3.1.2: 체결 확인 후에만 추적 시작 + 거래소 보호주문 id 전달
             self.exit_plan.start_tracking(
                 result["trade_id"], decision, result["quantity"],
@@ -782,14 +826,24 @@ class MainBot:
                 tp_order_id=result.get("tp_order_id"),
             )
             self.shadow.record(strategy_name=_SHADOW_STRATEGY, decision=decision)
-            sl_note = (
-                f" 🛡️SL주문 {result['sl_order_id']}"
-                if result.get("sl_order_id") else ""
-            )
+            entry_actual = result.get("entry_price_actual", quality.entry_price)
+            qty = result.get("quantity")
+            # 진입 즉시 알림 (요구 4)
             await self.telegram.send(
-                f"✅ 진입: {symbol} {quality.action} ${sizing.size_usdt:.2f} "
-                f"@ {result.get('entry_price_actual', quality.entry_price)} "
-                f"(lev {leverage}x, {regime_state.regime}){sl_note}"
+                f"✅ 진입: {symbol} {quality.action}\n"
+                f"진입가: {entry_actual}\n"
+                f"수량: {qty}\n"
+                f"notional: ${sizing.size_usdt:.2f}\n"
+                f"leverage: {leverage}x\n"
+                f"entry_order_id: {result.get('entry_order_id')}\n"
+                f"trade_id: {result.get('trade_id')}\n"
+                f"regime: {regime_state.regime}"
+            )
+            # 보호주문 등록 알림 (요구 5) — STOP/TP id + trigger
+            await self.telegram.send(
+                f"🛡️ 보호주문 등록: {symbol}\n"
+                f"sl_order_id: {result.get('sl_order_id')} (STOP trigger {quality.sl})\n"
+                f"tp_order_id: {result.get('tp_order_id')} (TP trigger {quality.tp})"
             )
         elif result.get("critical"):
             # v3.1.2 critical 사유는 여러 가지 — reason 으로 운영자에게 명확히 전달:
@@ -822,8 +876,9 @@ class MainBot:
             for r in reconciled:
                 self.exit_plan.stop_tracking(r["symbol"])
                 await self.telegram.send(
-                    f"📕 거래소 청산 감지: {r['symbol']} "
-                    f"(보호주문 체결, exit={r.get('exit_price')})"
+                    self._close_alert_text(
+                        r["symbol"], method="거래소 STOP/TP 체결(reconcile)"
+                    )
                 )
             if reconciled:
                 tracked = self.exit_plan.get_tracked()
@@ -839,8 +894,44 @@ class MainBot:
         for r in results:
             if r.get("closed"):
                 await self.telegram.send(
-                    f"📕 포지션 청산: {r['symbol']} ({', '.join(r['actions'])})"
+                    self._close_alert_text(
+                        r["symbol"], method=", ".join(r.get("actions", []))
+                    )
                 )
+
+    def _close_alert_text(self, symbol: str, method: str) -> str:
+        """청산 Telegram 메시지 — DB CLOSED 행에서 정밀 정보 조회 (요구 6)."""
+        s = self._closed_trade_summary(symbol)
+        if s is None:
+            return f"📕 포지션 청산: {symbol} ({method})"
+        return (
+            f"📕 포지션 청산: {symbol}\n"
+            f"청산 방식: {method}\n"
+            f"exit_price: {s.get('exit_price')}\n"
+            f"pnl_usd: {s.get('pnl_usd')}\n"
+            f"pnl_usd_net: {s.get('pnl_usd_net')}\n"
+            f"duration_seconds: {s.get('duration_seconds')}\n"
+            f"trade_status: {s.get('trade_status')}"
+        )
+
+    def _closed_trade_summary(self, symbol: str) -> dict | None:
+        """해당 symbol 의 가장 최근 CLOSED trades 행 요약을 반환한다(없으면 None)."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                row = conn.execute(
+                    "SELECT exit_price, pnl_usd, pnl_usd_net, duration_seconds, "
+                    "trade_status FROM trades WHERE symbol = ? AND exit_price IS NOT NULL "
+                    "ORDER BY id DESC LIMIT 1",
+                    (symbol,),
+                ).fetchone()
+            finally:
+                conn.close()
+            return dict(row) if row else None
+        except Exception as e:  # noqa: BLE001 — 알림용 조회 실패는 비치명적
+            logger.warning("[Main] %s 청산 요약 조회 실패: %s", symbol, e)
+            return None
 
     async def _maybe_run_weekly(self) -> None:
         """매주 지정 요일/시각에 WeeklyGPTAnalyst 를 1회 실행한다 (§8-8-3)."""
@@ -912,20 +1003,59 @@ class MainBot:
             logger.warning("[Heartbeat] 자본 조회 실패: %s", e)
             balance_str = "조회 실패"
 
+        # 보호종목 기존 보유분 불변 확인 (live 만, read-only). 변경 감지 시 CRITICAL.
+        protected_status = await self._check_protected_unchanged()
+
+        db_name = self.db_path.split("/")[-1].split("\\")[-1]
         await self.telegram.send(
             f"💓 하트비트 ({mode})\n"
             f"가동 시간: {self._format_timedelta(uptime)}\n"
-            f"루프 횟수: {self._loop_count}\n"
+            f"스캔 횟수: {self._scan_count} / 루프: {self._loop_count}\n"
+            f"누적 후보: {self._candidate_total} (직전 스캔 {self._last_candidate_count})\n"
+            f"진입 시도/성공: {self._entry_attempt_count}/{self._entry_count}\n"
+            f"미청산(봇 추적) 포지션: {open_count}\n"
             f"레짐: {regime}\n"
-            f"미청산 포지션: {open_count}\n"
             f"잔고: {balance_str}\n"
-            f"직전 스캔 후보: {self._last_candidate_count}"
+            f"ERROR/CRITICAL: {self._level_counter.errors}/{self._level_counter.criticals}\n"
+            f"DB: {db_name}\n"
+            f"보호종목 기존 보유분: {protected_status}"
         )
         self._last_heartbeat = now
         logger.info(
-            "[Heartbeat] 상태 전송 (uptime=%s, loop=%d)",
+            "[Heartbeat] 상태 전송 (uptime=%s, loop=%d, scans=%d, entries=%d)",
             self._format_timedelta(uptime), self._loop_count,
+            self._scan_count, self._entry_count,
         )
+
+    async def _check_protected_unchanged(self) -> str:
+        """heartbeat 용 — 기존 보호종목 보유분이 baseline 대비 불변인지 확인한다.
+
+        live + baseline 존재 시에만 read-only 조회. 변경 감지 시 CRITICAL 알림 +
+        로그(요구 7: 기존 보호종목 항목 변경 감지). 반환 문자열은 heartbeat 표시용.
+        """
+        if self.dry_run or self._protected_baseline is None:
+            return "N/A (baseline 없음)"
+        try:
+            cur = {
+                "positions": sorted(await self.executor.preflight_open_position_symbols()),
+                "orders": sorted(await self.executor.preflight_open_order_symbols()),
+                "algos": sorted(await self.executor.preflight_open_algo_symbols()),
+            }
+        except Exception as e:  # noqa: BLE001 — 조회 실패는 heartbeat 비치명적
+            logger.warning("[Heartbeat] 보호종목 불변 확인 조회 실패: %s", e)
+            return "확인 실패"
+        if cur == self._protected_baseline:
+            return "불변 ✅ (봇 비접근)"
+        # 변경 감지 → CRITICAL (기존 보유분이 바뀜 — 봇 외 요인 또는 사고)
+        logger.critical(
+            "[Heartbeat] 기존 보호종목 보유분 변경 감지! baseline=%s cur=%s",
+            self._protected_baseline, cur,
+        )
+        await self.telegram.send(
+            "🚨 CRITICAL: 기존 보호종목 보유분 변경 감지 — 거래소 확인 필요\n"
+            f"baseline={self._protected_baseline}\ncurrent={cur}"
+        )
+        return "변경 감지 🚨"
 
     @staticmethod
     def _format_timedelta(td: timedelta) -> str:
@@ -946,6 +1076,15 @@ class MainBot:
         봇 포지션으로 기록하지도 않는다(거래소 조회만, INSERT 없음).
         """
         protected = set(self.pair_wl.protected_symbols)
+
+        # One-way Mode 확인 (executor 캐시 공유 — 진입 시 재조회 안 함). Hedge 면 차단.
+        one_way_ok, mode_reason = await self.executor._ensure_one_way_mode()
+        if not one_way_ok:
+            msg = f"[Preflight] position mode 문제 → 시작 차단: {mode_reason}"
+            logger.critical(msg)
+            await self.telegram.send("🚨 CRITICAL " + msg)
+            raise RuntimeError(mode_reason or "position_mode_blocked")
+
         try:
             pos_syms = await self.executor.preflight_open_position_symbols()
             order_syms = await self.executor.preflight_open_order_symbols()
@@ -953,8 +1092,15 @@ class MainBot:
         except Exception as e:
             msg = f"[Preflight] 기존 계좌 상태 조회 실패 → 시작 차단(fail-closed): {e}"
             logger.critical(msg)
-            await self.telegram.send("🛑 " + msg)
+            await self.telegram.send("🚨 CRITICAL " + msg)
             raise RuntimeError("live preflight query failed") from e
+
+        # heartbeat 불변 비교용 baseline 기록
+        self._protected_baseline = {
+            "positions": sorted(pos_syms),
+            "orders": sorted(order_syms),
+            "algos": sorted(algo_syms),
+        }
 
         existing = (
             [("position", s) for s in pos_syms]
@@ -966,18 +1112,19 @@ class MainBot:
             detail = ", ".join(f"{k}:{s}" for k, s in non_protected)
             msg = f"[Preflight] 비보호종목 기존 항목 존재 → 시작 차단: {detail}"
             logger.critical(msg)
-            await self.telegram.send("🛑 " + msg)
+            await self.telegram.send("🚨 CRITICAL " + msg)
             raise RuntimeError(f"non-protected existing items: {detail}")
 
-        if existing:
-            detail = ", ".join(f"{k}:{s}" for k, s in existing)
-            logger.warning(
-                "[Preflight] 기존 보호종목 보유분 공존(봇 비접근): %s", detail
-            )
-            await self.telegram.send(
-                "🛡️ 기존 보호종목 보유분 공존 — 봇이 절대 건드리지 않습니다:\n" + detail
-            )
-        else:
+        # preflight 결과 상세 알림 (요구 2: One-way / 공존 / 비보호 0 / PASS)
+        await self.telegram.send(
+            "✅ Live Preflight PASS\n"
+            f"One-way Mode: 예 (dualSidePosition=False)\n"
+            f"기존 보호종목 공존 항목: {len(existing)}건"
+            + (f" ({', '.join(f'{k}:{s}' for k, s in existing)})" if existing else "")
+            + "\n비보호종목 기존 포지션/주문/algo: 0건\n"
+            "→ 기존 보호종목 보유분은 봇이 절대 건드리지 않습니다."
+        )
+        if not existing:
             logger.info("[Preflight] 기존 포지션/주문/algo 없음 — 깨끗한 계좌")
 
     async def _close_all_positions_safe(self) -> None:
