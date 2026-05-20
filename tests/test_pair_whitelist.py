@@ -18,6 +18,7 @@ import logging
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock
 
+from config.settings import PAIR_WHITELIST_CONFIG
 from strategy.pair_whitelist import PairWhitelist
 
 
@@ -129,6 +130,30 @@ def test_get_active_excludes_protected_symbol():
     active = pw.get_active(capital=10000)
     assert "BTCUSDT" not in active
     assert "ETHUSDT" in active  # 보호되지 않은 Tier 1은 포함
+
+
+# ── 시나리오 12: 기본 보호종목 6개 전부 차단 (INJUSDT 포함) ──
+def test_all_default_protected_symbols_blocked():
+    """config 기본 보호종목 6개(BTC/ETH/HOLO/CFX/LYN/INJ)가 모두 차단된다."""
+    expected = {"BTCUSDT", "ETHUSDT", "HOLOUSDT", "CFXUSDT", "LYNUSDT", "INJUSDT"}
+    assert expected.issubset(set(PAIR_WHITELIST_CONFIG.protected_symbols))
+    pw = PairWhitelist(MagicMock(),
+                       protected_symbols=PAIR_WHITELIST_CONFIG.protected_symbols)
+    for sym in expected:
+        assert pw.is_allowed(sym, capital=100000) is False, f"{sym} 미차단"
+    # 비보호 종목은 영향 없음
+    assert pw.is_allowed("SOLUSDT", capital=100000) is True
+
+
+# ── 시나리오 13: INJUSDT manual_unblock 거부 ──
+def test_injusdt_manual_unblock_rejected(caplog):
+    """INJUSDT 도 manual_unblock 으로 풀리지 않는다(보호 절대 룰)."""
+    pw = PairWhitelist(MagicMock(),
+                       protected_symbols=PAIR_WHITELIST_CONFIG.protected_symbols)
+    with caplog.at_level(logging.WARNING, logger="strategy.pair_whitelist"):
+        pw.manual_unblock("INJUSDT")
+    assert pw.is_allowed("INJUSDT", capital=100000) is False
+    assert "INJUSDT" not in pw.get_active(capital=100000)
 
 
 def _PROTECTED_REASON_IN(reasons: list) -> bool:

@@ -41,7 +41,7 @@
 
 - **`.env` 키 구조**: 실거래(`BINANCE_API_KEY/SECRET`)와 테스트넷(`BINANCE_TESTNET_API_KEY/SECRET`)
   키가 분리됨. `USE_TESTNET` 값에 따라 `collector._build_client`가 자동 선택. 둘은 별개 발급처.
-- **보호 종목** (`protected_symbols`): `BTCUSDT, ETHUSDT, HOLOUSDT, LYNUSDT` — 봇이 절대 거래 못함.
+- **보호 종목** (`protected_symbols`): `BTCUSDT, ETHUSDT, HOLOUSDT, CFXUSDT, LYNUSDT, INJUSDT` — 봇이 절대 거래 못함.
   환경변수 `PROTECTED_SYMBOLS` 우선, 없으면 `config/settings.py` 기본값.
 - **CMC**: `CMC_API_KEY` 있으면 PairWhitelist Tier 3 시총 검증에 사용, 없으면 graceful 스킵.
 - **dry-run**: `python main_7590.py --dry-run --duration <초>` — 거래소 주문 스킵, DB 기록은 수행.

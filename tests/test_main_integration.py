@@ -213,7 +213,8 @@ async def test_start_sends_protected_symbol_alert(bot):
     sent = [c.args[0] for c in bot.telegram.send.call_args_list]
     protected_msg = next((m for m in sent if "보호 종목 활성" in m), None)
     assert protected_msg is not None
-    for sym in ("BTCUSDT", "ETHUSDT", "HOLOUSDT", "LYNUSDT"):
+    # 보호 종목 6개 전부 알림에 포함 (INJUSDT 추가)
+    for sym in ("BTCUSDT", "ETHUSDT", "HOLOUSDT", "CFXUSDT", "LYNUSDT", "INJUSDT"):
         assert sym in protected_msg
 
 

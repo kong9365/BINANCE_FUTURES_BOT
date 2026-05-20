@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 # 보호 종목 하드코딩 기본값 (운영자 수동 거래 자산 — 봇 영구 차단)
 # 환경변수 PROTECTED_SYMBOLS 가 비어 있거나 오타로 빈 결과를 내면 이 값으로 폴백한다.
-_DEFAULT_PROTECTED_SYMBOLS = ["BTCUSDT", "ETHUSDT", "HOLOUSDT", "CFXUSDT", "LYNUSDT"]
+_DEFAULT_PROTECTED_SYMBOLS = ["BTCUSDT", "ETHUSDT", "HOLOUSDT", "CFXUSDT", "LYNUSDT", "INJUSDT"]
 
 
 def _resolve_protected_symbols() -> List[str]:

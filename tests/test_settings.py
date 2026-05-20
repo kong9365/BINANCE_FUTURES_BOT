@@ -245,7 +245,7 @@ def test_pair_whitelist_config_defaults():
     assert isinstance(PAIR_WHITELIST_CONFIG, PairWhitelistConfig)
 
 
-_DEFAULT_PROTECTED = ["BTCUSDT", "ETHUSDT", "HOLOUSDT", "CFXUSDT", "LYNUSDT"]
+_DEFAULT_PROTECTED = ["BTCUSDT", "ETHUSDT", "HOLOUSDT", "CFXUSDT", "LYNUSDT", "INJUSDT"]
 
 
 def test_pair_whitelist_protected_symbols():
