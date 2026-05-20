@@ -668,6 +668,48 @@ async def test_reconcile_dry_run_noop(db_path, mock_binance):
     assert await ex.reconcile_closed_positions(["SOLUSDT"]) == []
 
 
+# ── Protected Existing Position Coexist Mode ────────────────────────
+
+async def test_close_position_protected_blocked(db_path, mock_binance):
+    """보호종목 close_position → 거래소 API 미호출 + protected_symbol_close_blocked."""
+    ex = TradeExecutor(mock_binance, db_path, dry_run=False,
+                       protected_symbols=["INJUSDT", "LYNUSDT"])
+    result = await ex.close_position("INJUSDT", reason="x")
+    assert result["success"] is False
+    assert result["reason"] == "protected_symbol_close_blocked"
+    # 어떤 거래소 청산/취소 API 도 호출되지 않음 (기존 보유분 보존)
+    mock_binance.futures_create_order.assert_not_called()
+    mock_binance.futures_cancel_algo_order.assert_not_called()
+    mock_binance.futures_cancel_order.assert_not_called()
+    mock_binance.futures_position_information.assert_not_called()
+
+
+async def test_close_position_nonprotected_still_works(db_path, mock_binance):
+    """비보호종목은 정상 청산 (guard 가 보호종목만 막는지 확인)."""
+    ex = TradeExecutor(mock_binance, db_path, dry_run=False,
+                       protected_symbols=["INJUSDT"])
+    _seed_open_trade(ex, symbol="SOLUSDT")
+    mock_binance.futures_position_information.return_value = [
+        {"symbol": "SOLUSDT", "positionAmt": "0.5", "entryPrice": "100.0",
+         "unRealizedProfit": "0.0"},
+    ]
+    mock_binance.futures_create_order.return_value = {
+        "avgPrice": "101.0", "orderId": 5, "executedQty": "0.5",
+    }
+    result = await ex.close_position("SOLUSDT", reason="take_profit")
+    assert result["success"] is True
+
+
+async def test_reconcile_skips_protected(db_path, mock_binance):
+    """tracked 에 보호종목이 섞여도 reconcile 은 보호종목을 건드리지 않는다."""
+    ex = TradeExecutor(mock_binance, db_path, dry_run=False,
+                       protected_symbols=["INJUSDT"])
+    mock_binance.futures_position_information.return_value = []  # 모두 사라진 것처럼
+    closed = await ex.reconcile_closed_positions(["INJUSDT"])
+    assert closed == []  # 보호종목은 skip → 마감 처리 안 함
+    mock_binance.futures_cancel_algo_order.assert_not_called()
+
+
 # ── 15. replace_stop_order (BE/트레일) ──────────────────────────────
 
 async def test_replace_stop_create_first_success(db_path, mock_binance):

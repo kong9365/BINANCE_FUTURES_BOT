@@ -20,6 +20,7 @@ from config.settings import (
     PairWhitelistConfig,
     RegimeConfig,
     RegimeTradingParams,
+    LiveProbeConfig,
     RiskRules,
     SizingConfig,
     SystemConfig,
@@ -37,6 +38,7 @@ from config.settings import (
     SIZING_CONFIG,
     SYSTEM_CONFIG,
     TRADE_EXECUTOR_CONFIG,
+    LIVE_PROBE_CONFIG,
     WEEKLY_ANALYST_CONFIG,
 )
 
@@ -310,6 +312,25 @@ def test_trade_executor_config_defaults():
     assert c.price_protect is True
     assert c.block_hedge_mode is True
     assert isinstance(TRADE_EXECUTOR_CONFIG, TradeExecutorConfig)
+
+
+# ── LiveProbeConfig (Protected Existing Position Coexist Mode) ──
+def test_live_probe_config_defaults():
+    c = LiveProbeConfig()
+    assert c.allow_existing_protected_positions is True
+    assert c.live_probe_budget_usdt == 300.0
+    assert isinstance(LIVE_PROBE_CONFIG, LiveProbeConfig)
+
+
+def test_live_probe_budget_env_override(monkeypatch):
+    monkeypatch.setenv("LIVE_PROBE_BUDGET_USDT", "150")
+    assert LiveProbeConfig().live_probe_budget_usdt == 150.0
+
+
+def test_live_probe_budget_invalid_env_falls_back(monkeypatch):
+    for bad in ("", "abc", "0", "-5"):
+        monkeypatch.setenv("LIVE_PROBE_BUDGET_USDT", bad)
+        assert LiveProbeConfig().live_probe_budget_usdt == 300.0
 
 
 # ── 패키지 export ──

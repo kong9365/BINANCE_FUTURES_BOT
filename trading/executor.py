@@ -111,6 +111,7 @@ class TradeExecutor:
         working_type: str = "MARK_PRICE",
         price_protect: bool = True,
         block_hedge_mode: bool = True,
+        protected_symbols: list[str] | None = None,
     ) -> None:
         """실행기 초기화.
 
@@ -130,6 +131,10 @@ class TradeExecutor:
                 live 신규 진입을 차단한다(A-4). 이 봇은 One-way Mode 전제로 설계됐고
                 Hedge Mode 를 지원하지 않으므로 기본 True. position mode 조회는 첫
                 live 진입 시 1회 수행 후 캐시한다.
+            protected_symbols: 보호종목 목록(Protected Existing Position Coexist Mode).
+                close_position / reconcile 가 이 종목들의 기존 보유분을 절대 청산·
+                취소하지 않도록 guard 한다. 봇은 이 종목을 신규 진입도 하지 않는다
+                (진입 차단은 PairWhitelist 책임). None 이면 빈 집합(가드 비활성).
         """
         if not db_path:
             logger.warning("[Executor] db_path 가 비어 있음 — DB 기록이 실패합니다")
@@ -154,6 +159,8 @@ class TradeExecutor:
         self.working_type = working_type
         self.price_protect = price_protect
         self.block_hedge_mode = block_hedge_mode
+        # Protected Existing Position Coexist Mode — 기존 보호종목 보유분 보존
+        self._protected_symbols: set[str] = set(protected_symbols or [])
 
         # exchangeInfo 심볼 필터 캐시 (M3)
         self._filters: dict[str, dict] = {}
@@ -1026,6 +1033,15 @@ class TradeExecutor:
         Returns:
             {"success", "symbol", "reason", "portion"}.
         """
+        # Protected Existing Position Coexist Mode — 보호종목 기존 보유분은 절대
+        # 청산/취소하지 않는다. 거래소 API(주문/취소) 호출 자체를 하지 않는다.
+        if symbol in self._protected_symbols:
+            logger.warning(
+                "[Executor] %s 보호종목 — 청산/취소 차단(기존 보유분 보존)", symbol
+            )
+            return {"success": False, "symbol": symbol,
+                    "reason": "protected_symbol_close_blocked", "portion": portion}
+
         if not 0.0 < portion <= 1.0:
             logger.error("[Executor] %s 잘못된 portion=%s", symbol, portion)
             return {"success": False, "symbol": symbol,
@@ -1114,6 +1130,11 @@ class TradeExecutor:
 
         closed: list[dict] = []
         for symbol in tracked_symbols:
+            # 방어적 — 보호종목은 reconcile 정리 대상에서 제외(기존 보유분 보존).
+            # 정상적으로는 보호종목이 tracked 에 들어오지 않으나, 이중 안전망.
+            if symbol in self._protected_symbols:
+                logger.warning("[Executor] %s 보호종목 — reconcile skip", symbol)
+                continue
             if symbol in live_symbols:
                 continue
             # 추적 중인데 거래소 포지션 없음 → STOP/TP 체결(or 외부 청산)
@@ -1134,6 +1155,28 @@ class TradeExecutor:
             closed.append({"symbol": symbol, "exit_price": exit_price,
                            "reason": "exchange_stop_or_tp"})
         return closed
+
+    # ── live preflight (Protected Existing Position Coexist Mode) ──────
+    # 아래 3개는 main 의 _live_account_preflight 전용. 조회 실패 시 예외를 그대로
+    # 전파하여 호출부가 fail-closed(시작 차단) 하도록 한다. get_open_positions 처럼
+    # 실패를 [] 로 삼키지 않는다(빈 결과를 '없음'으로 오인 → fail-open 방지).
+
+    async def preflight_open_position_symbols(self) -> list[str]:
+        """기존 열린 포지션의 심볼 목록(positionAmt != 0). 조회 실패 시 예외."""
+        raw = await asyncio.to_thread(self.binance.futures_position_information)
+        return [p["symbol"] for p in (raw or [])
+                if float(p.get("positionAmt", 0) or 0) != 0]
+
+    async def preflight_open_order_symbols(self) -> list[str]:
+        """기존 일반 Open Orders 의 심볼 목록. 조회 실패 시 예외."""
+        raw = await asyncio.to_thread(self.binance.futures_get_open_orders)
+        return [o["symbol"] for o in (raw or [])]
+
+    async def preflight_open_algo_symbols(self) -> list[str]:
+        """기존 Open Algo Orders 의 심볼 목록. 조회 실패 시 예외."""
+        ao = await asyncio.to_thread(self.binance.futures_get_open_algo_orders)
+        orders = ao.get("orders") if isinstance(ao, dict) else (ao or [])
+        return [o["symbol"] for o in orders]
 
     async def _cancel_trade_protective_orders(self, symbol: str) -> None:
         """미청산 trades 행에 기록된 sl/tp algo 주문을 취소한다(best-effort).

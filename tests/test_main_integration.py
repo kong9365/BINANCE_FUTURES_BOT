@@ -35,6 +35,7 @@ import pytest
 
 from data.capital_manager import CapitalSnapshot
 from data.oi_scanner import Candidate
+from trading.executor import Position
 from db.init_db import init_db
 from sizing.dynamic_sizer import SizingResult
 from strategy.regime_detector import Regime
@@ -199,6 +200,107 @@ def test_telegram_token_url_not_logged_at_info(caplog):
     assert not any(
         "api.telegram.org/bot" in r.getMessage() for r in caplog.records
     ), "httpx INFO 로그(토큰 URL)가 억제되지 않음"
+
+
+# ── Protected Existing Position Coexist Mode ────────────────────────
+
+async def test_preflight_allows_only_protected_existing(bot):
+    """기존 포지션/주문/algo 가 모두 보호종목이면 preflight 통과(공존 허용)."""
+    bot.executor.preflight_open_position_symbols = AsyncMock(
+        return_value=["INJUSDT", "LYNUSDT"])
+    bot.executor.preflight_open_order_symbols = AsyncMock(return_value=["ETHUSDT"])
+    bot.executor.preflight_open_algo_symbols = AsyncMock(return_value=["INJUSDT"])
+    bot.telegram.send.reset_mock()
+
+    await bot._live_account_preflight()   # 예외 없이 통과해야 함
+
+    sent = [c.args[0] for c in bot.telegram.send.call_args_list]
+    assert any("공존" in m for m in sent)
+
+
+async def test_preflight_blocks_nonprotected_existing_position(bot):
+    bot.executor.preflight_open_position_symbols = AsyncMock(return_value=["SOLUSDT"])
+    bot.executor.preflight_open_order_symbols = AsyncMock(return_value=[])
+    bot.executor.preflight_open_algo_symbols = AsyncMock(return_value=[])
+    with pytest.raises(RuntimeError):
+        await bot._live_account_preflight()
+
+
+async def test_preflight_blocks_nonprotected_existing_order(bot):
+    bot.executor.preflight_open_position_symbols = AsyncMock(return_value=["INJUSDT"])
+    bot.executor.preflight_open_order_symbols = AsyncMock(return_value=["SOLUSDT"])
+    bot.executor.preflight_open_algo_symbols = AsyncMock(return_value=[])
+    with pytest.raises(RuntimeError):
+        await bot._live_account_preflight()
+
+
+async def test_preflight_blocks_nonprotected_existing_algo(bot):
+    bot.executor.preflight_open_position_symbols = AsyncMock(return_value=[])
+    bot.executor.preflight_open_order_symbols = AsyncMock(return_value=[])
+    bot.executor.preflight_open_algo_symbols = AsyncMock(return_value=["SOLUSDT"])
+    with pytest.raises(RuntimeError):
+        await bot._live_account_preflight()
+
+
+async def test_preflight_query_failure_fail_closed(bot):
+    """기존 계좌 조회 실패 → fail-closed(시작 차단)."""
+    bot.executor.preflight_open_position_symbols = AsyncMock(
+        side_effect=RuntimeError("net down"))
+    bot.executor.preflight_open_order_symbols = AsyncMock(return_value=[])
+    bot.executor.preflight_open_algo_symbols = AsyncMock(return_value=[])
+    with pytest.raises(RuntimeError):
+        await bot._live_account_preflight()
+
+
+async def test_close_all_excludes_protected(bot):
+    """emergency close-all 은 보호종목 기존 포지션을 제외하고 비보호만 청산한다."""
+    bot.executor.get_open_positions = AsyncMock(return_value=[
+        Position("INJUSDT", 1.0, 10.0, 0.0, "LONG"),
+        Position("LYNUSDT", 2.0, 5.0, 0.0, "LONG"),
+        Position("SOLUSDT", 0.5, 100.0, 0.0, "LONG"),
+    ])
+    bot.executor.close_position = AsyncMock(return_value={"success": True})
+
+    await bot._close_all_positions_safe()
+
+    closed = [c.args[0] for c in bot.executor.close_position.call_args_list]
+    assert "SOLUSDT" in closed
+    assert "INJUSDT" not in closed
+    assert "LYNUSDT" not in closed
+
+
+async def test_live_probe_budget_cap(bot, monkeypatch):
+    """사이징 capital 이 min(available, live_probe_budget_usdt) 로 cap 된다."""
+    import config.settings as settings
+    monkeypatch.setattr(settings.LIVE_PROBE_CONFIG, "live_probe_budget_usdt", 300.0)
+    bot.risk_manager.check_all = AsyncMock(return_value=True)
+
+    captured = {}
+    real_calc = bot.sizer.calculate
+
+    def spy(**kwargs):
+        captured["capital"] = kwargs.get("capital")
+        return real_calc(**kwargs)
+
+    bot.sizer.calculate = MagicMock(side_effect=spy)
+
+    await bot._handle_signal(
+        _candidate("SOLUSDT"), _regime(Regime.TREND_UP, 0.8),
+        _snapshot(available=1886.0),
+    )
+    assert captured.get("capital") == 300.0   # min(1886, 300)
+
+
+async def test_existing_protected_not_recorded_in_db(bot, db_path):
+    """preflight 가 기존 보호종목을 조회해도 trades 에 INSERT 하지 않는다."""
+    bot.executor.preflight_open_position_symbols = AsyncMock(
+        return_value=["INJUSDT", "LYNUSDT"])
+    bot.executor.preflight_open_order_symbols = AsyncMock(return_value=["ETHUSDT"])
+    bot.executor.preflight_open_algo_symbols = AsyncMock(return_value=["INJUSDT"])
+
+    await bot._live_account_preflight()
+
+    assert _fetch_all(db_path, "trades") == []
 
 
 # ── 1~2. 시작 시퀀스 ────────────────────────────────────────────────

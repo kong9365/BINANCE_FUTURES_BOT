@@ -53,6 +53,7 @@ from config.settings import (
     CAPITAL_MANAGER_CONFIG,
     COST_GUARD_CONFIG,
     HEALTH_MONITOR_CONFIG,
+    LIVE_PROBE_CONFIG,
     MACRO_EVENT_CONFIG,
     PAIR_WHITELIST_CONFIG,
     REGIME_CONFIG,
@@ -350,6 +351,8 @@ class MainBot:
             working_type=TRADE_EXECUTOR_CONFIG.working_type,
             price_protect=TRADE_EXECUTOR_CONFIG.price_protect,
             block_hedge_mode=TRADE_EXECUTOR_CONFIG.block_hedge_mode,
+            # Protected Existing Position Coexist Mode — 보호종목 기존 보유분 보존
+            protected_symbols=PAIR_WHITELIST_CONFIG.protected_symbols,
         )
         # default_max_hold_minutes 는 폴백값 — 실제로는 _handle_signal 이
         # 진입 시 params.max_hold_minutes 로 매번 명시 주입한다.
@@ -413,6 +416,12 @@ class MainBot:
 
         # 4) 초기 자본 영속화 (부록 E-7-2 — 재시작 시 복원)
         self._sync_initial_capital(initial_snapshot)
+
+        # 4-b) live 계좌 사전 점검 (Protected Existing Position Coexist Mode)
+        #     기존 포지션/주문/algo 가 모두 보호종목이면 공존 허용, 비보호 잔존 시 차단.
+        #     dry_run 은 거래소 조회를 하지 않는다(API 미호출 원칙).
+        if not self.dry_run:
+            await self._live_account_preflight()
 
         # 5) 보호 종목 확인 + Telegram 알림 (부록 E-5-3)
         if self.pair_wl.protected_symbols:
@@ -690,12 +699,18 @@ class MainBot:
             return
 
         # 5) 사이징 — available_balance 기준 (부록 E-5-2)
+        #    + LIVE_PROBE_BUDGET_USDT cap: 소액 실거래 연결 검증 동안 신규 거래
+        #      예산을 제한한다. capital = min(available, live_probe_budget).
         win_rate, sample_count = self.expectancy.get_win_rate(
             quality.setup_tag, return_count=True
         )
         avg_win, avg_loss = self.expectancy.get_avg_R(quality.setup_tag)
+        budget_cap = min(
+            capital_snapshot.available_balance,
+            LIVE_PROBE_CONFIG.live_probe_budget_usdt,
+        )
         sizing = self.sizer.calculate(
-            capital=capital_snapshot.available_balance,
+            capital=budget_cap,
             win_rate=win_rate,
             avg_win_R=avg_win,
             avg_loss_R=avg_loss,
@@ -709,11 +724,11 @@ class MainBot:
             )
             return
 
-        # 마진 부족 추가 검증 (부록 E-5-2)
-        if sizing.size_usdt > capital_snapshot.available_balance:
+        # 예산/마진 초과 검증 (부록 E-5-2 + LIVE_PROBE_BUDGET cap)
+        if sizing.size_usdt > budget_cap:
             logger.warning(
-                "[Sizer] %s 사이즈 $%.2f > available $%.2f → 차단",
-                symbol, sizing.size_usdt, capital_snapshot.available_balance,
+                "[Sizer] %s 사이즈 $%.2f > budget_cap $%.2f → 차단",
+                symbol, sizing.size_usdt, budget_cap,
             )
             return
 
@@ -920,10 +935,64 @@ class MainBot:
         minutes, seconds = divmod(rem, 60)
         return f"{hours}h {minutes}m {seconds}s"
 
+    async def _live_account_preflight(self) -> None:
+        """live 시작 전 기존 계좌 상태 점검 (Protected Existing Position Coexist Mode).
+
+        기존 포지션/Open Orders/Open Algo Orders 를 read-only 로 조회해 분류한다.
+          - 비보호종목 항목이 하나라도 있으면 시작 차단(RuntimeError, fail-closed).
+          - 모두 보호종목이면 공존 허용 — "봇 비접근" 경고 후 진행.
+          - 조회 실패 시 fail-closed(시작 차단).
+        보호종목 기존 보유분은 봇이 절대 청산/취소하지 않으며 bot_live.db 에
+        봇 포지션으로 기록하지도 않는다(거래소 조회만, INSERT 없음).
+        """
+        protected = set(self.pair_wl.protected_symbols)
+        try:
+            pos_syms = await self.executor.preflight_open_position_symbols()
+            order_syms = await self.executor.preflight_open_order_symbols()
+            algo_syms = await self.executor.preflight_open_algo_symbols()
+        except Exception as e:
+            msg = f"[Preflight] 기존 계좌 상태 조회 실패 → 시작 차단(fail-closed): {e}"
+            logger.critical(msg)
+            await self.telegram.send("🛑 " + msg)
+            raise RuntimeError("live preflight query failed") from e
+
+        existing = (
+            [("position", s) for s in pos_syms]
+            + [("order", s) for s in order_syms]
+            + [("algo", s) for s in algo_syms]
+        )
+        non_protected = [(k, s) for (k, s) in existing if s not in protected]
+        if non_protected:
+            detail = ", ".join(f"{k}:{s}" for k, s in non_protected)
+            msg = f"[Preflight] 비보호종목 기존 항목 존재 → 시작 차단: {detail}"
+            logger.critical(msg)
+            await self.telegram.send("🛑 " + msg)
+            raise RuntimeError(f"non-protected existing items: {detail}")
+
+        if existing:
+            detail = ", ".join(f"{k}:{s}" for k, s in existing)
+            logger.warning(
+                "[Preflight] 기존 보호종목 보유분 공존(봇 비접근): %s", detail
+            )
+            await self.telegram.send(
+                "🛡️ 기존 보호종목 보유분 공존 — 봇이 절대 건드리지 않습니다:\n" + detail
+            )
+        else:
+            logger.info("[Preflight] 기존 포지션/주문/algo 없음 — 깨끗한 계좌")
+
     async def _close_all_positions_safe(self) -> None:
-        """critical 상황 — 모든 열린 포지션을 안전 청산한다 (§8-8-3)."""
+        """critical 상황 — 열린 포지션을 안전 청산한다 (§8-8-3).
+
+        Protected Existing Position Coexist Mode: 보호종목 기존 보유분은 emergency
+        close 대상에서 제외한다(봇이 연 비보호종목 포지션만 청산).
+        """
         positions = await self.executor.get_open_positions()
         for pos in positions:
+            if pos.symbol in self.pair_wl.protected_symbols:
+                logger.info(
+                    "[Safe Close] %s 보호종목 — 청산 제외(기존 보유분 보존)", pos.symbol
+                )
+                continue
             try:
                 await self.executor.close_position(
                     pos.symbol, reason="system_critical"

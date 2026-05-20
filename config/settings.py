@@ -345,3 +345,34 @@ class TradeExecutorConfig:
 
 
 TRADE_EXECUTOR_CONFIG = TradeExecutorConfig()
+
+
+# ─────────────────────────────────────────────────────
+# LiveProbe — 소액 실거래 연결 검증 (Protected Existing Position Coexist Mode)
+# ─────────────────────────────────────────────────────
+def _resolve_live_probe_budget() -> float:
+    """LIVE_PROBE_BUDGET_USDT 환경변수 우선, 없거나 비정상이면 300.0 로 폴백."""
+    raw = os.environ.get("LIVE_PROBE_BUDGET_USDT")
+    if raw is None:
+        return 300.0
+    try:
+        v = float(raw)
+    except ValueError:
+        logger.warning("[Config] LIVE_PROBE_BUDGET_USDT 파싱 실패(%r) → 300.0 사용", raw)
+        return 300.0
+    if v <= 0:
+        logger.warning("[Config] LIVE_PROBE_BUDGET_USDT <= 0 (%s) → 300.0 사용", v)
+        return 300.0
+    return v
+
+
+@dataclass
+class LiveProbeConfig:
+    # 기존 보호종목 포지션/주문/algo 공존 허용 (봇은 절대 비접근 — 보존)
+    allow_existing_protected_positions: bool = True
+    # 신규 거래 예산 상한(USDT). 사이징 capital 을 min(available, 이 값) 으로 cap.
+    # 환경변수 LIVE_PROBE_BUDGET_USDT 우선.
+    live_probe_budget_usdt: float = field(default_factory=_resolve_live_probe_budget)
+
+
+LIVE_PROBE_CONFIG = LiveProbeConfig()
