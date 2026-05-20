@@ -25,6 +25,7 @@ MainBot 통합 흐름 테스트 (mock 환경).
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -37,7 +38,7 @@ from data.oi_scanner import Candidate
 from db.init_db import init_db
 from sizing.dynamic_sizer import SizingResult
 from strategy.regime_detector import Regime
-from main_7590 import MainBot, _resolve_db_path
+from main_7590 import MainBot, _resolve_db_path, _suppress_http_client_logs
 
 
 # ── fixtures / helpers ──────────────────────────────────────────────
@@ -176,6 +177,28 @@ async def test_executor_uses_config_defaults_unchanged(db_path, monkeypatch):
     assert ex.working_type == "MARK_PRICE"
     assert ex.price_protect is True
     assert ex.block_hedge_mode is True
+
+
+# ── 보안: httpx/httpcore 로그 억제 (Telegram 토큰 URL 노출 차단) ──────
+
+def test_httpx_log_suppressed():
+    """_suppress_http_client_logs 가 httpx/httpcore 로거를 WARNING 이상으로 올린다."""
+    _suppress_http_client_logs()
+    assert logging.getLogger("httpx").level >= logging.WARNING
+    assert logging.getLogger("httpcore").level >= logging.WARNING
+
+
+def test_telegram_token_url_not_logged_at_info(caplog):
+    """httpx 의 INFO 레벨 URL 로그(토큰 포함)가 억제되어 기록되지 않는다."""
+    _suppress_http_client_logs()
+    with caplog.at_level(logging.INFO):
+        # 실제 운영에서 httpx 가 찍던 형태 (토큰 자리는 플레이스홀더)
+        logging.getLogger("httpx").info(
+            "HTTP Request: POST https://api.telegram.org/bot<TOKEN>/sendMessage"
+        )
+    assert not any(
+        "api.telegram.org/bot" in r.getMessage() for r in caplog.records
+    ), "httpx INFO 로그(토큰 URL)가 억제되지 않음"
 
 
 # ── 1~2. 시작 시퀀스 ────────────────────────────────────────────────

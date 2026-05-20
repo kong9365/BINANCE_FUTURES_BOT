@@ -1045,6 +1045,18 @@ async def _amain(args: argparse.Namespace) -> None:
         await bot.shutdown()
 
 
+def _suppress_http_client_logs() -> None:
+    """HTTP 클라이언트 라이브러리의 INFO 로그를 억제한다(보안).
+
+    Telegram Bot API 토큰은 URL(https://api.telegram.org/bot<TOKEN>/...)에
+    포함되므로, httpx/httpcore 가 요청 URL 을 INFO 로 찍으면 토큰이 콘솔/파일
+    로그에 평문 노출된다. 두 로거를 WARNING 이상으로 올려 URL INFO 로그를
+    억제한다. 알림 전송 기능 자체는 영향 없음(전송은 그대로 동작).
+    """
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
 def main() -> None:
     """동기 진입점 — .env 로드 → 시그널 핸들러 등록 → 로깅 설정 → 비동기 메인 실행."""
     # .env 의 BINANCE_API_KEY / OPENAI_API_KEY / TELEGRAM_* 등을 os.environ 으로
@@ -1062,6 +1074,7 @@ def main() -> None:
         level=getattr(logging, log_level, logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    _suppress_http_client_logs()
 
     # SIGTERM → graceful shutdown (운영 배포 시 kill/systemd/docker stop 대응).
     # SIGINT(Ctrl+C)은 파이썬 기본 KeyboardInterrupt 로 이미 처리된다.
