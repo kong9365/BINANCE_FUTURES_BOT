@@ -23,6 +23,7 @@ from config.settings import (
     RiskRules,
     SizingConfig,
     SystemConfig,
+    TradeExecutorConfig,
     WeeklyAnalystConfig,
     BACKTEST_CONFIG,
     CAPITAL_MANAGER_CONFIG,
@@ -35,6 +36,7 @@ from config.settings import (
     RISK_RULES,
     SIZING_CONFIG,
     SYSTEM_CONFIG,
+    TRADE_EXECUTOR_CONFIG,
     WEEKLY_ANALYST_CONFIG,
 )
 
@@ -295,6 +297,19 @@ def test_capital_manager_config_defaults():
     assert c.forbid_spot_access is True
     assert c.persist_initial_capital is True
     assert isinstance(CAPITAL_MANAGER_CONFIG, CapitalManagerConfig)
+
+
+# ── TradeExecutorConfig (v3.1.2 algoOrder/A-4 — C-1 main 연결 대상) ──
+def test_trade_executor_config_defaults():
+    c = TradeExecutorConfig()
+    assert c.fill_timeout_s == 15.0
+    assert c.fill_poll_interval_s == 1.0
+    assert c.exchange_info_ttl_s == 3600.0
+    assert c.place_take_profit is True
+    assert c.working_type == "MARK_PRICE"
+    assert c.price_protect is True
+    assert c.block_hedge_mode is True
+    assert isinstance(TRADE_EXECUTOR_CONFIG, TradeExecutorConfig)
 
 
 # ── 패키지 export ──

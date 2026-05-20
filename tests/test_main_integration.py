@@ -123,6 +123,61 @@ def _fetch_all(db_path: str, table: str) -> list[sqlite3.Row]:
         conn.close()
 
 
+# ── C-1. TradeExecutorConfig main 연결 ──────────────────────────────
+
+async def test_executor_receives_settings_config(db_path, monkeypatch):
+    """C-1 — MainBot 이 TRADE_EXECUTOR_CONFIG 값을 executor 에 실제로 주입한다."""
+    import config.settings as settings
+
+    monkeypatch.delenv("CMC_API_KEY", raising=False)
+    # settings 값을 기본과 다르게 바꿔 주입 여부를 검증 (공유 싱글톤 mutate)
+    monkeypatch.setattr(settings.TRADE_EXECUTOR_CONFIG, "fill_timeout_s", 7.5)
+    monkeypatch.setattr(settings.TRADE_EXECUTOR_CONFIG, "fill_poll_interval_s", 0.25)
+    monkeypatch.setattr(settings.TRADE_EXECUTOR_CONFIG, "exchange_info_ttl_s", 123.0)
+    monkeypatch.setattr(settings.TRADE_EXECUTOR_CONFIG, "place_take_profit", False)
+    monkeypatch.setattr(settings.TRADE_EXECUTOR_CONFIG, "working_type", "CONTRACT_PRICE")
+    monkeypatch.setattr(settings.TRADE_EXECUTOR_CONFIG, "price_protect", False)
+    monkeypatch.setattr(settings.TRADE_EXECUTOR_CONFIG, "block_hedge_mode", False)
+
+    collector = MagicMock()
+    collector.client = MagicMock()
+    telegram = MagicMock()
+    telegram.send = AsyncMock()
+
+    b = MainBot(dry_run=True, db_path=db_path, collector=collector,
+                openai_client=None, telegram=telegram)
+
+    ex = b.executor
+    assert ex.fill_timeout_s == 7.5
+    assert ex.fill_poll_interval_s == 0.25
+    assert ex.exchange_info_ttl_s == 123.0
+    assert ex.place_take_profit is False
+    assert ex.working_type == "CONTRACT_PRICE"
+    assert ex.price_protect is False
+    assert ex.block_hedge_mode is False
+
+
+async def test_executor_uses_config_defaults_unchanged(db_path, monkeypatch):
+    """C-1 — settings 미변경 시 executor 기본 동작값과 동일(기존 동작 불변)."""
+    monkeypatch.delenv("CMC_API_KEY", raising=False)
+    collector = MagicMock()
+    collector.client = MagicMock()
+    telegram = MagicMock()
+    telegram.send = AsyncMock()
+
+    b = MainBot(dry_run=True, db_path=db_path, collector=collector,
+                openai_client=None, telegram=telegram)
+
+    ex = b.executor
+    assert ex.fill_timeout_s == 15.0
+    assert ex.fill_poll_interval_s == 1.0
+    assert ex.exchange_info_ttl_s == 3600.0
+    assert ex.place_take_profit is True
+    assert ex.working_type == "MARK_PRICE"
+    assert ex.price_protect is True
+    assert ex.block_hedge_mode is True
+
+
 # ── 1~2. 시작 시퀀스 ────────────────────────────────────────────────
 
 async def test_start_sends_protected_symbol_alert(bot):
@@ -286,6 +341,26 @@ async def test_protective_failure_sends_critical_alert(bot):
     sent = [c.args[0] for c in bot.telegram.send.call_args_list]
     assert any("🚨 CRITICAL" in m and "SOLUSDT" in m for m in sent)
     # 추적 시작 안 함
+    assert "SOLUSDT" not in bot.exit_plan.get_tracked()
+
+
+async def test_hedge_mode_critical_alert(bot):
+    """executor 가 Hedge Mode 차단(critical) 반환 시 reason 이 Telegram 에 명확히 노출."""
+    bot.risk_manager.check_all = AsyncMock(return_value=True)
+    bot.executor.enter_trade = AsyncMock(return_value={
+        "success": False, "critical": True, "trade_id": None,
+        "symbol": "SOLUSDT", "sl_order_id": None, "tp_order_id": None,
+        "reason": "hedge_mode_blocked",
+    })
+    bot.telegram.send.reset_mock()
+
+    await bot._handle_signal(_candidate("SOLUSDT"), _regime(Regime.TREND_UP, 0.8),
+                             _snapshot())
+
+    sent = [c.args[0] for c in bot.telegram.send.call_args_list]
+    # A-4 요구 10 — 차단 reason 이 운영자에게 명확히 보여야 함
+    assert any("🚨 CRITICAL" in m and "SOLUSDT" in m and "hedge_mode_blocked" in m
+               for m in sent)
     assert "SOLUSDT" not in bot.exit_plan.get_tracked()
 
 

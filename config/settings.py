@@ -334,8 +334,14 @@ class TradeExecutorConfig:
     fill_poll_interval_s: float = 1.0     # futures_get_order 폴링 주기
     # exchangeInfo 심볼 필터 캐시 TTL (감사 M3/[5])
     exchange_info_ttl_s: float = 3600.0
-    # 거래소 보호 주문 (감사 C1)
-    place_take_profit: bool = True        # reduceOnly TAKE_PROFIT_MARKET 도 생성
+    # 거래소 보호 주문 (감사 C1 + 2025-12-09 algoOrder 전환)
+    place_take_profit: bool = True        # closePosition TAKE_PROFIT_MARKET 도 생성
+    # 보호 주문 트리거 기준가 (MARK_PRICE 권장 — wick stop hunt 방지)
+    working_type: str = "MARK_PRICE"      # "MARK_PRICE" / "CONTRACT_PRICE"
+    # 보호 주문 가격 보호 (Binance priceProtect)
+    price_protect: bool = True            # algoOrder 의 priceProtect 파라미터
+    # Hedge Mode 차단 (A-4) — 이 봇은 One-way 전용. Hedge 면 live 진입 차단
+    block_hedge_mode: bool = True
 
 
 TRADE_EXECUTOR_CONFIG = TradeExecutorConfig()

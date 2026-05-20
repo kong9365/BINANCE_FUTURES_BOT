@@ -60,6 +60,7 @@ from config.settings import (
     RISK_RULES,
     SIZING_CONFIG,
     SYSTEM_CONFIG,
+    TRADE_EXECUTOR_CONFIG,
     WEEKLY_ANALYST_CONFIG,
 )
 
@@ -336,8 +337,19 @@ class MainBot:
         )
 
         # ── 거래 실행 / 청산 관리 ──
+        # C-1: TRADE_EXECUTOR_CONFIG 를 명시 주입 (운영자가 settings 에서 조정 가능).
+        # 기본값은 executor.__init__ 기본값과 동일하므로 기존 동작 불변.
         self.executor = TradeExecutor(
-            self.binance, db_path=self.db_path, dry_run=dry_run
+            self.binance,
+            db_path=self.db_path,
+            dry_run=dry_run,
+            fill_timeout_s=TRADE_EXECUTOR_CONFIG.fill_timeout_s,
+            fill_poll_interval_s=TRADE_EXECUTOR_CONFIG.fill_poll_interval_s,
+            exchange_info_ttl_s=TRADE_EXECUTOR_CONFIG.exchange_info_ttl_s,
+            place_take_profit=TRADE_EXECUTOR_CONFIG.place_take_profit,
+            working_type=TRADE_EXECUTOR_CONFIG.working_type,
+            price_protect=TRADE_EXECUTOR_CONFIG.price_protect,
+            block_hedge_mode=TRADE_EXECUTOR_CONFIG.block_hedge_mode,
         )
         # default_max_hold_minutes 는 폴백값 — 실제로는 _handle_signal 이
         # 진입 시 params.max_hold_minutes 로 매번 명시 주입한다.
@@ -765,12 +777,13 @@ class MainBot:
                 f"(lev {leverage}x, {regime_state.regime}){sl_note}"
             )
         elif result.get("critical"):
-            # v3.1.2: 보호주문 실패 → 방금 연 포지션 강제청산됨 (운영자 즉시 확인)
-            logger.critical("[Main] %s 보호주문 실패 강제청산: %s",
-                            symbol, result.get("reason"))
+            # v3.1.2 critical 사유는 여러 가지 — reason 으로 운영자에게 명확히 전달:
+            #   보호주문 실패 강제청산 / 고아 포지션 강제청산(A-5) /
+            #   Hedge Mode 차단(A-4) / position mode 조회 실패 등.
+            reason = result.get("reason", "")
+            logger.critical("[Main] %s CRITICAL 진입 중단/청산: %s", symbol, reason)
             await self.telegram.send(
-                f"🚨 CRITICAL: {symbol} 손절 주문 실패로 포지션 강제청산됨 — "
-                f"거래소 확인 필요 ({result.get('reason')})"
+                f"🚨 CRITICAL: {symbol} 진입 중단 — 거래소 확인 필요 ({reason})"
             )
         else:
             logger.warning("[Main] %s 진입 실패: %s", symbol, result.get("reason"))

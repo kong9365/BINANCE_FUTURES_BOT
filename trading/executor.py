@@ -10,7 +10,7 @@ TradeExecutor — 진입 주문 실행(체결 확인) + 거래소 보호 주문 
 v3.1.2 감사 후속 (실거래 중단급 수정):
   - C2: 진입은 "주문 접수"가 아니라 **FILLED 확인** 후에만 성공 처리한다.
     newClientOrderId 멱등 + futures_get_order 폴링. 타임아웃 시 cancel.
-  - C1: 진입 체결 직후 거래소 reduceOnly STOP_MARKET(필수) +
+  - C1: 진입 체결 직후 거래소 closePosition STOP_MARKET(필수) +
     TAKE_PROFIT_MARKET(옵션)를 생성한다. 손절 주문 실패 시 즉시 시장가 청산.
   - H1: 체결·보호주문이 모두 성공한 뒤에만 trades 행을 INSERT 한다(유령 행 방지).
   - H2: newClientOrderId 로 멱등성 확보.
@@ -19,11 +19,24 @@ v3.1.2 감사 후속 (실거래 중단급 수정):
   - M3: 수량/가격을 exchangeInfo 필터(LOT_SIZE/PRICE_FILTER/MIN_NOTIONAL)로
     정규화한다. 필터 조회 실패 시 live 주문을 차단한다.
 
+v3.1.2 추가 (2025-12-09 Binance Algo Service 전환):
+  - 보호 주문(STOP_MARKET / TAKE_PROFIT_MARKET / TRAILING_STOP_MARKET)은
+    2025-12-09 부터 POST /fapi/v1/algoOrder 로만 받는다(-4120 STOP_ORDER_SWITCH_ALGO).
+    → 진입 후 SL/TP 는 futures_create_algo_order(algoType="CONDITIONAL", ...) 로
+       생성하고, 취소는 futures_cancel_algo_order(algoId|clientAlgoId), 조회는
+       futures_get_algo_order 를 사용한다.
+  - 진입 LIMIT(GTX)은 기존 futures_create_order / futures_cancel_order 그대로 유지.
+  - algoOrder 페이로드 가드:
+      closePosition="true" 사용 → 반드시 quantity 와 reduceOnly 미전송
+      (요구 [2]: 두 파라미터 동시 전송 시 Binance 가 거부).
+  - DB(sl_order_id / tp_order_id / entry_order_id)는 **문자열**로 저장.
+    algoId(정수)와 clientAlgoId(문자열) 모두 수용. cancel 시 isdigit() 로 분기.
+
 설계 메모:
   - dry_run=True: 어떤 Binance 주문/조회 API 도 호출하지 않는다(페이퍼).
     체결가=entry_price 로 가정하고 정규화·보호주문은 생략, trades INSERT 만 수행.
   - 거래소·DB 동기 호출은 asyncio.to_thread 로 래핑(메인 루프 비차단).
-  - 보호 주문은 closePosition=True 로 생성 → 부분 청산 후에도 잔여 포지션을
+  - 보호 주문은 closePosition="true" 로 생성 → 부분 청산 후에도 잔여 포지션을
     자동 전량 보호. SL 이 하드 플로어, ExitPlanController 는 분할 TP/트레일/
     시간 스톱 + SL 갱신을 담당한다.
 =====================================================================
@@ -95,6 +108,9 @@ class TradeExecutor:
         fill_poll_interval_s: float = 1.0,
         exchange_info_ttl_s: float = 3600.0,
         place_take_profit: bool = True,
+        working_type: str = "MARK_PRICE",
+        price_protect: bool = True,
+        block_hedge_mode: bool = True,
     ) -> None:
         """실행기 초기화.
 
@@ -105,7 +121,15 @@ class TradeExecutor:
             fill_timeout_s: 진입 주문 FILLED 대기 한도(초). 초과 시 cancel.
             fill_poll_interval_s: futures_get_order 폴링 주기(초).
             exchange_info_ttl_s: 심볼 필터 캐시 TTL(초).
-            place_take_profit: True 면 reduceOnly TAKE_PROFIT_MARKET 도 생성.
+            place_take_profit: True 면 closePosition TAKE_PROFIT_MARKET 도 생성.
+            working_type: 보호 주문 트리거 기준가 ("MARK_PRICE" / "CONTRACT_PRICE").
+                MARK_PRICE 권장 — wick stop hunt 방지 (운영 결정 사항).
+            price_protect: True 면 algoOrder 의 priceProtect="true" 로 전송한다
+                (Binance 공식 명세: STRING "true"/"false" 소문자).
+            block_hedge_mode: True 면 계정이 Hedge Mode(dualSidePosition=True)일 때
+                live 신규 진입을 차단한다(A-4). 이 봇은 One-way Mode 전제로 설계됐고
+                Hedge Mode 를 지원하지 않으므로 기본 True. position mode 조회는 첫
+                live 진입 시 1회 수행 후 캐시한다.
         """
         if not db_path:
             logger.warning("[Executor] db_path 가 비어 있음 — DB 기록이 실패합니다")
@@ -114,6 +138,12 @@ class TradeExecutor:
                 "[Executor] binance_client=None 인데 dry_run=False — "
                 "enter_trade 가 항상 실패합니다"
             )
+        if working_type not in ("MARK_PRICE", "CONTRACT_PRICE"):
+            logger.warning(
+                "[Executor] working_type=%r 비표준 — Binance 기본(CONTRACT_PRICE) "
+                "으로 대체될 수 있음",
+                working_type,
+            )
         self.binance = binance_client
         self.db_path = db_path
         self.dry_run = dry_run
@@ -121,10 +151,17 @@ class TradeExecutor:
         self.fill_poll_interval_s = fill_poll_interval_s
         self.exchange_info_ttl_s = exchange_info_ttl_s
         self.place_take_profit = place_take_profit
+        self.working_type = working_type
+        self.price_protect = price_protect
+        self.block_hedge_mode = block_hedge_mode
 
         # exchangeInfo 심볼 필터 캐시 (M3)
         self._filters: dict[str, dict] = {}
         self._filters_loaded_at: float = 0.0
+
+        # position mode 캐시 (A-4) — 첫 live 진입 시 1회 확인 후 재사용
+        self._position_mode_checked: bool = False
+        self._is_hedge_mode: bool | None = None
 
     # ── 진입 ────────────────────────────────────────────────────
 
@@ -180,6 +217,14 @@ class TradeExecutor:
                 entry_order_id=None, sl_order_id=None, tp_order_id=None,
             )
 
+        # ── live: Hedge Mode 차단 (A-4) ──
+        # One-way Mode 전제. Hedge Mode 면 positionSide 누락/오매칭 위험이 있어
+        # 신규 진입을 막는다. 조회 실패도 live 에서는 fail-closed.
+        ok, hedge_reason = await self._ensure_one_way_mode()
+        if not ok:
+            logger.critical("[Executor] %s 진입 차단: %s", symbol, hedge_reason)
+            return self._fail(symbol, decision, hedge_reason, critical=True)
+
         # ── live: exchangeInfo 필터 정규화 (M3) ──
         norm_qty, norm_price, reason = await self._normalize(
             symbol, size_usdt / entry_price, entry_price
@@ -194,7 +239,13 @@ class TradeExecutor:
             symbol, action, norm_qty, norm_price, leverage, client_order_id
         )
         if not confirm["filled"]:
-            return self._fail(symbol, decision, confirm["reason"])
+            # A-5: 조회 실패/타임아웃이 고아 포지션을 만들었을 수 있다 → critical 전파.
+            # _await_fill 이 이미 강제청산했거나(orphan), 포지션 조회 실패로 fail-closed
+            # 한 경우 critical=True 로 main 에서 즉시 Telegram 경고가 나가도록 한다.
+            return self._fail(
+                symbol, decision, confirm["reason"],
+                critical=confirm.get("critical", False),
+            )
 
         filled_qty = confirm["filled_qty"]
         avg_price = confirm["avg_price"] or norm_price
@@ -222,11 +273,12 @@ class TradeExecutor:
         )
         if not result["success"]:
             # DB 기록 실패 → 보호주문 cancel + 포지션 청산(고아 방지) (요구 8)
+            # 2025-12-09 전환: 보호주문은 algo 엔드포인트로 생성됐으므로 cancel 도 algo.
             logger.critical(
                 "[Executor] %s trades 기록 실패 → 보호주문 cancel + 포지션 청산", symbol
             )
-            await self._cancel_order_safe(symbol, sl_order_id)
-            await self._cancel_order_safe(symbol, tp_order_id)
+            await self._cancel_algo_order_safe(symbol, sl_order_id)
+            await self._cancel_algo_order_safe(symbol, tp_order_id)
             await self._force_close(symbol, action, filled_qty)
             result["critical"] = True
         return result
@@ -291,140 +343,423 @@ class TradeExecutor:
             )
         except Exception as e:
             logger.error("[Executor] %s 진입 주문 전송 실패: %s", symbol, e)
+            # 주문 전송 자체가 실패 → 포지션 생성 가능성 없음 → critical 아님.
             return {"filled": False, "filled_qty": 0.0, "avg_price": 0.0,
-                    "order_id": None, "reason": f"진입 주문 전송 실패: {e}"}
+                    "order_id": None, "critical": False,
+                    "reason": f"진입 주문 전송 실패: {e}"}
 
         order_id = order.get("orderId") if isinstance(order, dict) else None
         logger.info(
             "[Executor] %s GTX %s qty=%s @ %s (lev=%dx) 전송 — FILLED 대기",
             symbol, side, quantity, entry_price, leverage,
         )
-        return await self._await_fill(symbol, order_id, order)
+        return await self._await_fill(symbol, order_id, order, action)
 
-    async def _await_fill(self, symbol: str, order_id, last_order: dict) -> dict:
-        """진입 주문이 FILLED 될 때까지 폴링한다. 타임아웃 시 cancel.
+    async def _await_fill(
+        self, symbol: str, order_id, last_order: dict, action: str
+    ) -> dict:
+        """진입 주문이 FILLED 될 때까지 폴링한다. 타임아웃/조회 실패 시 안전 해소.
 
+        모든 반환 dict 는 "critical" 키를 포함한다(A-5).
         부분체결 단순화: 타임아웃 시 잔량은 cancel 하되 executedQty>0 이면
         체결분으로 진행한다(감사 H1 — 미체결 추적/유령 행 방지).
+        조회 실패로 체결을 확인할 수 없을 때는 _resolve_fill_timeout 이
+        실제 포지션을 확인해 고아 포지션을 방지한다(A-5).
         """
         deadline = time.monotonic() + self.fill_timeout_s
         while True:
-            try:
-                cur = await asyncio.to_thread(
-                    self.binance.futures_get_order, symbol=symbol, orderId=order_id
-                )
-            except Exception as e:
-                logger.error("[Executor] %s 주문 상태 조회 실패: %s", symbol, e)
+            cur, _query_ok = await self._safe_get_order(symbol, order_id)
+            if cur is None:
                 cur = last_order
             status = (cur or {}).get("status", "")
             if status == "FILLED":
                 eq, avg = self._extract_fill(cur)
                 logger.info("[Executor] %s 진입 FILLED qty=%s avg=%s", symbol, eq, avg)
                 return {"filled": True, "filled_qty": eq, "avg_price": avg,
-                        "order_id": order_id, "reason": "filled"}
+                        "order_id": order_id, "critical": False, "reason": "filled"}
             if status in _TERMINAL_FAIL_STATES:
                 logger.warning("[Executor] %s 진입 주문 %s — 진입 스킵", symbol, status)
                 return {"filled": False, "filled_qty": 0.0, "avg_price": 0.0,
-                        "order_id": order_id, "reason": f"주문 {status}"}
+                        "order_id": order_id, "critical": False,
+                        "reason": f"주문 {status}"}
             if time.monotonic() >= deadline:
-                # 타임아웃 — 잔여 주문 cancel 후 체결분 판정
-                await self._cancel_order_safe(symbol, order_id)
-                eq, avg = self._extract_fill(cur)
-                if eq > 0:
-                    logger.warning(
-                        "[Executor] %s 타임아웃 — 부분체결 qty=%s 로 진행 (잔량 cancel)",
-                        symbol, eq,
-                    )
-                    return {"filled": True, "filled_qty": eq, "avg_price": avg,
-                            "order_id": order_id, "reason": "partial_fill_timeout"}
-                logger.warning(
-                    "[Executor] %s 타임아웃 미체결 → cancel + 진입 스킵", symbol
+                return await self._resolve_fill_timeout(
+                    symbol, order_id, action, cur
                 )
-                return {"filled": False, "filled_qty": 0.0, "avg_price": 0.0,
-                        "order_id": order_id, "reason": "fill_timeout"}
             await asyncio.sleep(self.fill_poll_interval_s)
+
+    async def _ensure_one_way_mode(self) -> tuple[bool, str | None]:
+        """계정이 One-way Mode 인지 확인한다(A-4 — Hedge Mode 신규 진입 차단).
+
+        - dry_run: 거래소 호출 금지 → 항상 통과(True, None).
+        - block_hedge_mode=False: 검사 비활성 → 통과.
+        - 이미 확인됨: 캐시 사용(Hedge 면 차단, One-way 면 통과).
+        - 미확인: futures_get_position_mode 1회 호출.
+            dualSidePosition=True → 차단("hedge_mode_blocked").
+            조회 실패 → live fail-closed("position_mode_check_failed").
+              (실패는 캐시하지 않아 다음 진입에서 재시도)
+
+        Returns:
+            (ok, reason). ok=False 면 reason 이 차단 사유. 봇은 Hedge Mode 를
+            지원하지 않으며 이 메서드는 차단만 수행한다.
+        """
+        if self.dry_run or not self.block_hedge_mode:
+            return True, None
+        if self._position_mode_checked:
+            if self._is_hedge_mode:
+                return False, "hedge_mode_blocked"
+            return True, None
+        try:
+            mode = await asyncio.to_thread(self.binance.futures_get_position_mode)
+        except Exception as e:
+            # live fail-closed — 캐시하지 않고 다음 진입에서 재시도
+            logger.error(
+                "[Executor] position mode 조회 실패: %s — live 진입 차단(fail-closed)", e
+            )
+            return False, "position_mode_check_failed"
+        dual = bool(mode.get("dualSidePosition")) if isinstance(mode, dict) else False
+        self._is_hedge_mode = dual
+        self._position_mode_checked = True
+        if dual:
+            logger.critical(
+                "[Executor] 계정이 Hedge Mode(dualSidePosition=True) — "
+                "이 봇은 One-way 전용이므로 신규 진입을 차단합니다"
+            )
+            return False, "hedge_mode_blocked"
+        logger.info("[Executor] position mode = One-way (정상)")
+        return True, None
+
+    async def _safe_get_order(self, symbol: str, order_id) -> tuple[dict | None, bool]:
+        """futures_get_order 를 안전하게 호출한다.
+
+        Returns:
+            (order_dict, ok). 조회 성공이면 (dict, True), 실패/비dict 면 (None, False).
+        """
+        try:
+            o = await asyncio.to_thread(
+                self.binance.futures_get_order, symbol=symbol, orderId=order_id
+            )
+        except Exception as e:
+            logger.warning("[Executor] %s 주문 상태 조회 실패: %s", symbol, e)
+            return None, False
+        return (o, True) if isinstance(o, dict) else (None, False)
+
+    async def _resolve_fill_timeout(
+        self, symbol: str, order_id, action: str, last_cur: dict | None
+    ) -> dict:
+        """타임아웃 시점의 체결 여부를 해소한다(A-5 — 고아 포지션 방지).
+
+        흐름:
+            1) 최종 재조회 — FILLED 면 정상 진입으로 복구.
+            2) 잔여 주문 cancel(best-effort).
+            3) cancel 후 재조회 — 그 사이 FILLED 됐으면 복구.
+            4) 조회가 신뢰 가능(성공)하고 executedQty>0 → 기존 부분체결 정책 유지.
+            5) 조회가 신뢰 가능하고 executedQty==0 → 깔끔한 미체결(포지션 확인 불필요).
+            6) 조회가 끝까지 불신뢰(실패) → futures_position_information 로 실제 포지션
+               확인:
+                 - 조회 실패 → critical=True (fail-closed).
+                 - 포지션 존재 → _force_close + critical=True (고아 방지).
+                 - 포지션 없음 → 미체결.
+        """
+        # 1) 최종 재조회 (다른 시점 — 일시적 네트워크/레이트리밋 회복 가능)
+        final, final_ok = await self._safe_get_order(symbol, order_id)
+        if final_ok and final.get("status") == "FILLED":
+            eq, avg = self._extract_fill(final)
+            logger.warning(
+                "[Executor] %s 최종 재조회에서 FILLED 확인 — 정상 진입(qty=%s)", symbol, eq
+            )
+            return {"filled": True, "filled_qty": eq, "avg_price": avg,
+                    "order_id": order_id, "critical": False,
+                    "reason": "filled_on_final_requery"}
+
+        # 2) 잔여 주문 cancel (best-effort — 이미 체결됐다면 실패할 수 있음)
+        await self._cancel_order_safe(symbol, order_id)
+
+        # 3) cancel 후 재조회 (cancel 실패/이미 체결 케이스 포착)
+        post, post_ok = await self._safe_get_order(symbol, order_id)
+        if post_ok and post.get("status") == "FILLED":
+            eq, avg = self._extract_fill(post)
+            logger.warning(
+                "[Executor] %s cancel 후 재조회에서 FILLED 확인 — 정상 진입(qty=%s)",
+                symbol, eq,
+            )
+            return {"filled": True, "filled_qty": eq, "avg_price": avg,
+                    "order_id": order_id, "critical": False,
+                    "reason": "filled_after_cancel_attempt"}
+
+        # 신뢰 가능한 최신 스냅샷 선택
+        reliable = post_ok or final_ok
+        snap = post if post_ok else (final if final_ok else last_cur)
+        eq, avg = self._extract_fill(snap if isinstance(snap, dict) else {})
+
+        # 4) 신뢰 가능 + 부분체결 → 기존 정책 유지(체결분 진행)
+        if reliable and eq > 0:
+            logger.warning(
+                "[Executor] %s 타임아웃 — 부분체결 qty=%s 로 진행 (잔량 cancel)", symbol, eq
+            )
+            return {"filled": True, "filled_qty": eq, "avg_price": avg,
+                    "order_id": order_id, "critical": False,
+                    "reason": "partial_fill_timeout"}
+
+        # 5) 신뢰 가능 + 체결 0 → 깔끔한 미체결 (실포지션 없음 — 확인 불필요)
+        if reliable and eq <= 0:
+            logger.warning("[Executor] %s 타임아웃 미체결 → cancel + 진입 스킵", symbol)
+            return {"filled": False, "filled_qty": 0.0, "avg_price": 0.0,
+                    "order_id": order_id, "critical": False, "reason": "fill_timeout"}
+
+        # 6) 조회 불신뢰 → 실제 포지션 확인으로 고아 포지션 방지 (A-5 핵심)
+        has_pos, pos_amt, check_ok = await self._position_state(symbol)
+        if not check_ok:
+            logger.critical(
+                "[Executor] %s 체결 불명 + 포지션 조회 실패 → critical (fail-closed)", symbol
+            )
+            return {"filled": False, "filled_qty": 0.0, "avg_price": 0.0,
+                    "order_id": order_id, "critical": True,
+                    "reason": "fill_unknown_position_check_failed"}
+        if has_pos:
+            # 봇은 미체결로 판단했으나 실제 포지션이 존재 → DB/STOP 추적 없는 고아.
+            # 보수적으로 즉시 강제청산 + critical (DB 복구보다 위험 축소 우선).
+            # A-4 요구 11: 실제 position_amt 방향과 진입 action 불일치 여부를 로그로
+            # 명확히 남긴다(Hedge Mode 는 A-4 에서 차단되므로 실질 위험은 낮으나,
+            # _force_close 는 action 기준 close_side 라 방향 점검을 기록한다).
+            expected_long = (action == "LONG")
+            actual_long = (pos_amt > 0)
+            if expected_long != actual_long:
+                logger.critical(
+                    "[Executor] %s 포지션 방향 불일치 — action=%s 인데 position_amt=%s "
+                    "(_force_close 는 action 기준 청산; 운영자 거래소 확인 필요)",
+                    symbol, action, pos_amt,
+                )
+            logger.critical(
+                "[Executor] %s 미체결 판단했으나 실제 포지션 존재(amt=%s, action=%s) → 강제청산",
+                symbol, pos_amt, action,
+            )
+            await self._force_close(symbol, action, abs(pos_amt))
+            return {"filled": False, "filled_qty": 0.0, "avg_price": 0.0,
+                    "order_id": order_id, "critical": True,
+                    "reason": "orphan_position_force_closed"}
+        logger.warning(
+            "[Executor] %s 조회 불명이나 실포지션 없음 → 미체결 처리", symbol
+        )
+        return {"filled": False, "filled_qty": 0.0, "avg_price": 0.0,
+                "order_id": order_id, "critical": False,
+                "reason": "fill_timeout_no_position"}
+
+    async def _position_state(self, symbol: str) -> tuple[bool, float, bool]:
+        """심볼의 실제 포지션 존재 여부를 확인한다(A-5).
+
+        get_open_positions 는 조회 실패 시 [](빈 목록)을 반환해 "포지션 없음"과
+        "조회 실패"를 구분할 수 없으므로, 여기서는 futures_position_information 을
+        직접 호출해 실패를 명시적으로 구분한다(fail-closed 판단용).
+
+        Returns:
+            (has_position, position_amt, check_ok).
+            check_ok=False 면 조회 자체가 실패한 것(호출부가 fail-closed 처리).
+        """
+        try:
+            raw = await asyncio.to_thread(
+                self.binance.futures_position_information, symbol=symbol
+            )
+        except Exception as e:
+            logger.error("[Executor] %s 포지션 확인 실패: %s", symbol, e)
+            return False, 0.0, False
+        if raw is None:
+            return False, 0.0, False
+        for p in raw:
+            try:
+                if p.get("symbol") == symbol:
+                    amt = float(p.get("positionAmt", 0) or 0)
+                    if amt != 0:
+                        return True, amt, True
+            except (ValueError, TypeError, AttributeError):
+                continue
+        return False, 0.0, True
 
     async def _place_protective_orders(
         self, symbol: str, action: str, filled_qty: float, sl: float, tp: float,
     ) -> tuple[str | None, str | None]:
-        """진입 체결 직후 reduceOnly STOP_MARKET(+TAKE_PROFIT_MARKET)을 생성한다.
+        """진입 체결 직후 closePosition STOP_MARKET(+TAKE_PROFIT_MARKET)을 algoOrder
+        엔드포인트로 생성한다 (2025-12-09 Binance Algo Service 전환 대응).
 
-        closePosition=True 로 생성하여 부분 청산 후에도 잔여 전량을 보호한다.
+        closePosition="true" 로 생성하여 부분 청산 후에도 잔여 전량을 보호한다.
+        (가드: quantity 와 reduceOnly 는 절대 전송 금지 — _build_algo_payload 강제)
 
         Returns:
-            (sl_order_id, tp_order_id). STOP 실패 시 sl_order_id=None
+            (sl_order_id, tp_order_id) 모두 문자열. STOP 실패 시 sl_order_id=None
             (호출부가 강제청산). TP 실패는 비치명적(SL 이 하드 플로어)이라
             tp_order_id=None 로 두고 진행한다.
         """
         close_side = "SELL" if action == "LONG" else "BUY"
 
+        sl_client_id = self._gen_client_algo_id(symbol, "sl")
+        sl_payload = self._build_algo_payload(
+            symbol=symbol, side=close_side, order_type="STOP_MARKET",
+            trigger_price=sl, client_algo_id=sl_client_id,
+        )
         try:
             stop = await asyncio.to_thread(
-                self.binance.futures_create_order,
-                symbol=symbol,
-                side=close_side,
-                type="STOP_MARKET",
-                stopPrice=sl,
-                closePosition=True,
+                self.binance.futures_create_algo_order, **sl_payload
             )
-            sl_order_id = str(stop.get("orderId")) if isinstance(stop, dict) else None
-            logger.info("[Executor] %s 거래소 STOP_MARKET 등록 (stop=%s, id=%s)",
-                        symbol, sl, sl_order_id)
+            sl_order_id = self._extract_algo_id(stop) or sl_client_id
+            logger.info(
+                "[Executor] %s algo STOP_MARKET 등록 (trigger=%s, id=%s, workingType=%s)",
+                symbol, sl, sl_order_id, self.working_type,
+            )
         except Exception as e:
-            logger.error("[Executor] %s STOP_MARKET 생성 실패: %s", symbol, e)
+            logger.error("[Executor] %s algo STOP_MARKET 생성 실패: %s", symbol, e)
             return None, None
 
         tp_order_id: str | None = None
         if self.place_take_profit:
+            tp_client_id = self._gen_client_algo_id(symbol, "tp")
+            tp_payload = self._build_algo_payload(
+                symbol=symbol, side=close_side, order_type="TAKE_PROFIT_MARKET",
+                trigger_price=tp, client_algo_id=tp_client_id,
+            )
             try:
                 tp_o = await asyncio.to_thread(
-                    self.binance.futures_create_order,
-                    symbol=symbol,
-                    side=close_side,
-                    type="TAKE_PROFIT_MARKET",
-                    stopPrice=tp,
-                    closePosition=True,
+                    self.binance.futures_create_algo_order, **tp_payload
                 )
-                tp_order_id = str(tp_o.get("orderId")) if isinstance(tp_o, dict) else None
-                logger.info("[Executor] %s 거래소 TAKE_PROFIT_MARKET 등록 (tp=%s, id=%s)",
-                            symbol, tp, tp_order_id)
+                tp_order_id = self._extract_algo_id(tp_o) or tp_client_id
+                logger.info(
+                    "[Executor] %s algo TAKE_PROFIT_MARKET 등록 (trigger=%s, id=%s)",
+                    symbol, tp, tp_order_id,
+                )
             except Exception as e:
                 # TP 실패는 비치명적 — SL 이 이미 포지션을 보호한다
-                logger.warning("[Executor] %s TAKE_PROFIT_MARKET 생성 실패(비치명적): %s",
-                               symbol, e)
+                logger.warning(
+                    "[Executor] %s algo TAKE_PROFIT_MARKET 생성 실패(비치명적): %s",
+                    symbol, e,
+                )
         return sl_order_id, tp_order_id
+
+    def _build_algo_payload(
+        self, *, symbol: str, side: str, order_type: str,
+        trigger_price: float, client_algo_id: str,
+    ) -> dict:
+        """algoOrder payload 빌더 — closePosition 경로의 필수 가드를 강제한다.
+
+        Binance Algo Order 명세(2025-12-09 적용):
+            algoType="CONDITIONAL", type=STOP_MARKET/TAKE_PROFIT_MARKET/...
+            closePosition="true" (소문자) → **quantity 와 reduceOnly 동시 전송 금지**.
+            triggerPrice (구 stopPrice 와 다른 키).
+            workingType=MARK_PRICE / CONTRACT_PRICE — config 노출.
+            priceProtect="true"/"false" (소문자 — 공식 문서 기준; 일부 클라이언트
+                docstring 이 "TRUE"/"FALSE" 로 잘못 적혀 있음).
+            clientAlgoId — 멱등 + cancel 시 사용.
+
+        Args:
+            symbol, side ("BUY"/"SELL"), order_type (STOP_MARKET/...).
+            trigger_price: 트리거 가격 (구 stopPrice 가 아닌 triggerPrice 키).
+            client_algo_id: 멱등용 clientAlgoId (호출부에서 미리 생성).
+
+        Returns:
+            algoOrder POST 페이로드 dict. quantity / reduceOnly 키는 절대 포함되지 않음.
+        """
+        payload: dict = {
+            "algoType": "CONDITIONAL",
+            "symbol": symbol,
+            "side": side,
+            "type": order_type,
+            "triggerPrice": trigger_price,
+            "closePosition": "true",
+            "workingType": self.working_type,
+            "priceProtect": "true" if self.price_protect else "false",
+            "clientAlgoId": client_algo_id,
+        }
+        # 안전 가드 — closePosition="true" 경로에서 절대 보내면 안 되는 키 (요구 [2])
+        assert "quantity" not in payload, "algoOrder closePosition=true 경로에 quantity 금지"
+        assert "reduceOnly" not in payload, "algoOrder closePosition=true 경로에 reduceOnly 금지"
+        return payload
+
+    @staticmethod
+    def _extract_algo_id(resp) -> str | None:
+        """algoOrder 응답에서 식별자를 문자열로 반환한다(algoId 우선, clientAlgoId 폴백)."""
+        if not isinstance(resp, dict):
+            return None
+        algo_id = resp.get("algoId")
+        if algo_id is None:
+            algo_id = resp.get("clientAlgoId")
+        return str(algo_id) if algo_id is not None else None
+
+    @staticmethod
+    def _gen_client_algo_id(symbol: str, role: str) -> str:
+        """algo 보호 주문용 clientAlgoId 생성 (멱등 + 역할 식별).
+
+        role: "sl" (STOP_MARKET) / "tp" (TAKE_PROFIT_MARKET) 등.
+        Binance 최대 길이(보수적으로 36자) 내로 자른다.
+        """
+        return f"bot-{role}-{symbol[:8]}-{uuid.uuid4().hex[:10]}"[:36]
 
     async def replace_stop_order(
         self, symbol: str, old_sl_order_id: str | None, action: str, new_sl: float
     ) -> str | None:
-        """기존 거래소 STOP 을 취소하고 새 stopPrice 로 재생성한다(BE/트레일).
+        """기존 algo STOP 을 새 triggerPrice 로 교체한다(BE/트레일).
 
-        dry_run 은 no-op 으로 None 을 반환한다.
+        A-3 (create-first): 무방비 구간을 만들지 않기 위해 순서를 뒤집는다.
+            1) 새 STOP 을 먼저 생성한다.
+            2) 새 STOP 생성 성공 시 DB sl_order_id 를 새 ID 로 먼저 갱신한다.
+               (ExitPlanController 의 plan.sl_order_id 갱신은 호출부가 반환값으로 처리)
+            3) 그 다음 기존 STOP 을 cancel 한다.
+            4) 기존 STOP cancel 실패는 warning 만 — 새 STOP 은 그대로 유지.
+            5) 새 STOP 생성 실패 시 기존 STOP 은 **절대 cancel 하지 않는다** (요구 7).
+               기존 STOP 은 거래소에 그대로 남아 하드 손절을 계속 보장.
+
+        중간에 거래소 STOP 가 잠시 2개 존재할 수 있지만, 둘 다 closePosition=true
+        로 등록되어 어느 한쪽이 트리거되면 포지션이 전량 청산되고 다른 한쪽은
+        만료/잔여 상태가 된다. reconcile / _cancel_trade_protective_orders 가 잔여
+        STOP 을 정리한다.
+
+        dry_run 은 no-op 으로 None 을 반환한다(요구 8).
 
         Returns:
-            새 STOP 주문 id. 실패 시 None(호출부가 경고 후 재시도, 소프트웨어
-            SL 은 여전히 동작하므로 무방비 아님).
+            새 STOP 주문 id(문자열 — algoId 또는 clientAlgoId). 실패 시 None
+            (기존 STOP 유지, 호출부가 다음 루프 재시도).
         """
         if self.dry_run:
             return None
-        await self._cancel_order_safe(symbol, old_sl_order_id)
+
+        # ── 1) 새 STOP 을 먼저 생성 ──
         close_side = "SELL" if action == "LONG" else "BUY"
+        client_algo_id = self._gen_client_algo_id(symbol, "sl")
+        payload = self._build_algo_payload(
+            symbol=symbol, side=close_side, order_type="STOP_MARKET",
+            trigger_price=new_sl, client_algo_id=client_algo_id,
+        )
         try:
             stop = await asyncio.to_thread(
-                self.binance.futures_create_order,
-                symbol=symbol,
-                side=close_side,
-                type="STOP_MARKET",
-                stopPrice=new_sl,
-                closePosition=True,
+                self.binance.futures_create_algo_order, **payload
             )
-            new_id = str(stop.get("orderId")) if isinstance(stop, dict) else None
-            logger.info("[Executor] %s STOP 갱신 → stop=%s (id=%s)", symbol, new_sl, new_id)
-            await asyncio.to_thread(self._update_sl_order_id, symbol, new_id)
-            return new_id
+            new_id = self._extract_algo_id(stop) or client_algo_id
         except Exception as e:
-            logger.warning("[Executor] %s STOP 갱신 실패: %s — 다음 루프 재시도", symbol, e)
+            # 새 STOP 생성 실패 — 기존 STOP 은 절대 cancel 하지 않는다 (요구 7)
+            logger.warning(
+                "[Executor] %s algo STOP 갱신 실패(기존 유지, 무방비 구간 없음): %s — "
+                "다음 루프 재시도", symbol, e,
+            )
             return None
+
+        logger.info(
+            "[Executor] %s algo STOP 갱신 → trigger=%s (id=%s) — 기존(%s) cancel 진행",
+            symbol, new_sl, new_id, old_sl_order_id,
+        )
+
+        # ── 2) DB 의 sl_order_id 먼저 새 ID 로 갱신 (실패해도 새 STOP 은 살아있음) ──
+        try:
+            await asyncio.to_thread(self._update_sl_order_id, symbol, new_id)
+        except Exception as e:
+            # DB 갱신 실패는 비치명적 — 다음 reconcile 에서 정합
+            logger.warning(
+                "[Executor] %s sl_order_id DB 갱신 실패(무시): %s", symbol, e,
+            )
+
+        # ── 3) 기존 STOP 을 그 다음 cancel (요구 5/6 — 실패는 warning) ──
+        #     _cancel_algo_order_safe 자체가 예외를 삼키지만, 명시적 가드를 위해
+        #     None/같은 ID 인 경우 호출 자체를 생략한다.
+        if old_sl_order_id and str(old_sl_order_id) != new_id:
+            await self._cancel_algo_order_safe(symbol, old_sl_order_id)
+
+        return new_id
 
     async def _force_close(self, symbol: str, action: str, quantity: float) -> None:
         """보호주문 실패 등 비상 시 reduceOnly 시장가로 즉시 청산한다(요구 7)."""
@@ -801,7 +1136,11 @@ class TradeExecutor:
         return closed
 
     async def _cancel_trade_protective_orders(self, symbol: str) -> None:
-        """미청산 trades 행에 기록된 sl/tp 주문을 취소한다(best-effort)."""
+        """미청산 trades 행에 기록된 sl/tp algo 주문을 취소한다(best-effort).
+
+        보호 주문은 algo 엔드포인트로 생성됐으므로 cancel 도 algo 엔드포인트 사용.
+        진입 LIMIT 의 _cancel_order_safe 와 분리 (요구 [10] — int 캐스팅 금지).
+        """
         try:
             row = await asyncio.to_thread(self._get_open_trade_order_ids, symbol)
         except Exception as e:
@@ -810,11 +1149,14 @@ class TradeExecutor:
         if not row:
             return
         sl_id, tp_id = row
-        await self._cancel_order_safe(symbol, sl_id)
-        await self._cancel_order_safe(symbol, tp_id)
+        await self._cancel_algo_order_safe(symbol, sl_id)
+        await self._cancel_algo_order_safe(symbol, tp_id)
 
     async def _cancel_order_safe(self, symbol: str, order_id) -> None:
-        """주문을 취소한다. 이미 없거나 실패해도 예외를 삼킨다."""
+        """진입 LIMIT 주문(orderId=int)을 취소한다. 이미 없거나 실패해도 예외 삼킴.
+
+        보호(algo) 주문 cancel 은 _cancel_algo_order_safe 사용 — int 캐스팅 금지.
+        """
         if not order_id:
             return
         try:
@@ -824,6 +1166,37 @@ class TradeExecutor:
             logger.info("[Executor] %s 주문 취소 (id=%s)", symbol, order_id)
         except Exception as e:
             logger.warning("[Executor] %s 주문 취소 실패(무시): id=%s %s", symbol, order_id, e)
+
+    async def _cancel_algo_order_safe(
+        self, symbol: str, algo_id: str | int | None
+    ) -> None:
+        """algo 보호 주문을 취소한다. algoId(int) / clientAlgoId(str) 자동 분기.
+
+        DB 의 sl_order_id / tp_order_id 는 TEXT 컬럼 — 봇이 응답에서 받은 algoId
+        를 문자열로 저장하거나, 응답에 id 가 없을 때는 clientAlgoId 를 저장한다.
+        cancel 시 그 문자열이 숫자로만 구성됐으면 algoId(int)로, 그렇지 않으면
+        clientAlgoId(str)로 라우팅한다. 어느 쪽 실패도 삼킴(best-effort).
+        """
+        if not algo_id:
+            return
+        algo_id_str = str(algo_id)
+        cancel_kwargs: dict = {"symbol": symbol}
+        if algo_id_str.isdigit():
+            cancel_kwargs["algoId"] = int(algo_id_str)
+        else:
+            cancel_kwargs["clientAlgoId"] = algo_id_str
+        try:
+            await asyncio.to_thread(
+                self.binance.futures_cancel_algo_order, **cancel_kwargs
+            )
+            logger.info(
+                "[Executor] %s algo 주문 취소 (id=%s)", symbol, algo_id_str
+            )
+        except Exception as e:
+            logger.warning(
+                "[Executor] %s algo 주문 취소 실패(무시): id=%s %s",
+                symbol, algo_id_str, e,
+            )
 
     async def _resolve_exit_fill(
         self, symbol: str, order: dict
