@@ -115,6 +115,7 @@ def test_collect_once_pushes_to_supabase(tmp_path):
     collect_oi.collect_once(
         symbols=["SOLUSDT"], client=client, out_dir=tmp_path,
         persist=persist, push_supabase=True, push_recent=None,
+        index_symbols=[], push_global=False,    # 글로벌/인덱스 분리 — 실네트워크 차단
     )
 
     pushed_tables = [c.args[0] for c in persist.upsert_many.call_args_list]
@@ -122,6 +123,62 @@ def test_collect_once_pushes_to_supabase(tmp_path):
     assert "oi_history" in pushed_tables
     assert "funding_history" in pushed_tables
     persist.flush_outbox.assert_called_once()
+
+
+def test_cmc_global_metrics_parses(monkeypatch):
+    from data.cmc_client import CMCClient
+    c = CMCClient("dummy-key")
+    payload = {"data": {"btc_dominance": 55.5, "eth_dominance": 18.0,
+                        "quote": {"USD": {"total_market_cap": 2.5e12,
+                                          "total_volume_24h": 1.2e11}}}}
+    fng = {"data": {"value": 40}}
+    calls = iter([payload, fng])
+    monkeypatch.setattr(c, "_get_json", lambda url: next(calls))
+    m = c.get_global_metrics()
+    assert m["btc_dominance"] == 55.5
+    assert m["total_market_cap_usd"] == 2.5e12
+    assert m["fear_greed"] == 40.0
+
+
+def test_push_market_global_skips_without_cmc():
+    persist = MagicMock()
+    assert collect_oi.push_market_global(persist, None) is False
+    persist.insert.assert_not_called()
+
+
+def test_push_market_global_inserts_row():
+    persist = MagicMock()
+    persist.insert.return_value = True
+    cmc = MagicMock()
+    cmc.get_global_metrics.return_value = {"btc_dominance": 55.0,
+                                           "total_market_cap_usd": 2e12}
+    assert collect_oi.push_market_global(persist, cmc) is True
+    args = persist.insert.call_args
+    assert args.args[0] == "market_global"
+    assert args.args[1]["source"] == "cmc"
+
+
+def test_collect_once_pushes_index_and_global(tmp_path):
+    klines = [_kline(0, 105), _kline(3_600_000, 112)]
+    oih = [{"timestamp": 0, "sumOpenInterest": "5000"},
+           {"timestamp": 3_600_000, "sumOpenInterest": "5250"}]
+    client = _client(klines, oih)
+    client.futures_funding_rate.return_value = [_funding(0)]
+    persist = MagicMock()
+    cmc = MagicMock()
+    cmc.get_global_metrics.return_value = {"btc_dominance": 55.0,
+                                           "total_market_cap_usd": 2e12}
+
+    collect_oi.collect_once(
+        symbols=["SOLUSDT"], client=client, out_dir=tmp_path,
+        persist=persist, push_supabase=True, push_recent=None,
+        index_symbols=["BTCUSDT"], cmc=cmc, push_global=True,
+    )
+
+    # 인덱스(BTCUSDT) OHLCV 가 ohlcv 테이블로 적재됨 + 글로벌 1행 insert
+    assert any(c.args[0] == "ohlcv" for c in persist.upsert_many.call_args_list)
+    assert any(c.args[0] == "market_global" for c in persist.insert.call_args_list)
+    cmc.get_global_metrics.assert_called_once()
 
 
 def test_push_recent_slices_rows():

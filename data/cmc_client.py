@@ -36,6 +36,10 @@ logger = logging.getLogger(__name__)
 _CMC_LISTINGS_URL = (
     "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest"
 )
+_CMC_GLOBAL_URL = (
+    "https://pro-api.coinmarketcap.com/v1/global-metrics/quotes/latest"
+)
+_CMC_FNG_URL = "https://pro-api.coinmarketcap.com/v3/fear-and-greed/latest"
 
 
 class CMCClient:
@@ -93,6 +97,53 @@ class CMCClient:
             return None
         self._maybe_refresh()
         return self._rank_map.get(symbol_base.upper())
+
+    def get_global_metrics(self) -> dict | None:
+        """글로벌 시장 지표(P5a) — BTC/ETH 도미넌스, 총 시총/거래량, F&G.
+
+        바이낸스가 제공하지 않는 시장 전역 집계만 반환한다(가격/OHLCV 용도 아님).
+        Fear&Greed 는 별도 엔드포인트(플랜에 따라 미제공) — best-effort, 실패 시 None.
+
+        Returns:
+            {btc_dominance, eth_dominance, total_market_cap_usd,
+             total_volume_24h_usd, fear_greed} 또는 조회 실패 시 None.
+        """
+        try:
+            payload = self._get_json(_CMC_GLOBAL_URL)
+        except Exception as e:  # noqa: BLE001
+            logger.error("[CMC] 글로벌 지표 조회 실패: %s", e)
+            return None
+        data = payload.get("data") or {}
+        usd = (data.get("quote") or {}).get("USD") or {}
+        out = {
+            "btc_dominance": data.get("btc_dominance"),
+            "eth_dominance": data.get("eth_dominance"),
+            "total_market_cap_usd": usd.get("total_market_cap"),
+            "total_volume_24h_usd": usd.get("total_volume_24h"),
+            "fear_greed": None,
+        }
+        try:  # F&G best-effort (플랜 미지원 시 무시)
+            fng = self._get_json(_CMC_FNG_URL)
+            val = (fng.get("data") or {}).get("value")
+            out["fear_greed"] = float(val) if val is not None else None
+        except Exception:  # noqa: BLE001
+            pass
+        return out
+
+    def _get_json(self, url: str) -> dict:
+        """CMC GET → JSON dict. API 키는 헤더로만 전송(로그 노출 금지)."""
+        req = urllib.request.Request(
+            url,
+            headers={
+                "X-CMC_PRO_API_KEY": self._api_key,
+                "Accept": "application/json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:  # noqa: S310 — 고정 HTTPS
+            payload = json.load(resp)
+        if not isinstance(payload, dict):
+            raise ValueError("CMC 응답이 dict 가 아님")
+        return payload
 
     def _maybe_refresh(self) -> None:
         """캐시가 비었거나 TTL 이 지났으면 순위 맵을 다시 조회한다.

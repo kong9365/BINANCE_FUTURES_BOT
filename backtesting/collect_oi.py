@@ -42,6 +42,9 @@ logger = logging.getLogger(__name__)
 # 멱등 — 1시간 갭 + 여유를 덮는다. --backfill 은 전체를 1회 시딩.
 _DEFAULT_PUSH_RECENT = 48
 
+# 시장-베타 인덱스(P5a) — 거래 아님, OHLCV read-only 인덱스로만 적재(보호종목 거래 금지 불변).
+_INDEX_SYMBOLS: List[str] = ["BTCUSDT", "ETHUSDT"]
+
 # 기본 수집 유니버스 — 유동성 높은 비보호 USDT 무기한(보호종목 제외).
 _DEFAULT_OI_COLLECT_SYMBOLS: List[str] = [
     "SOLUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT", "BNBUSDT", "AVAXUSDT",
@@ -73,6 +76,30 @@ def _build_persistence():
     """Supabase 주저장 + 로컬 폴백 어댑터(env 기반). 키 미설정 시 outbox 전용."""
     from data.persistence import SupabasePersistence
     return SupabasePersistence()
+
+
+def _build_cmc():
+    """CMC 클라이언트(env CMC_API_KEY). 키 없으면 None(글로벌 지표 스킵)."""
+    key = os.environ.get("CMC_API_KEY")
+    if not key:
+        return None
+    try:
+        from data.cmc_client import CMCClient
+        return CMCClient(key)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[CollectOI] CMC 클라이언트 생성 실패: %s", e)
+        return None
+
+
+def push_market_global(persist, cmc) -> bool:
+    """CMC 글로벌 지표 1행을 market_global 에 적재(스냅샷 시계열). cmc None 이면 스킵."""
+    if cmc is None:
+        logger.info("[CollectOI] CMC 미설정 — market_global 적재 스킵")
+        return False
+    metrics = cmc.get_global_metrics()
+    if not metrics:
+        return False
+    return persist.insert("market_global", {**metrics, "source": "cmc"})
 
 
 def fetch_funding(client, symbol: str, limit: int = 500) -> List[dict]:
@@ -146,6 +173,9 @@ def collect_once(
     persist=None,
     push_supabase: bool = True,
     push_recent: Optional[int] = _DEFAULT_PUSH_RECENT,
+    index_symbols: Optional[List[str]] = None,
+    cmc=None,
+    push_global: bool = True,
 ) -> Dict[str, int]:
     """1회 수집 패스 — 유니버스 OI+OHLCV 를 캐시에 누적하고 Supabase 에 적재.
 
@@ -179,6 +209,25 @@ def collect_once(
                 persist, sym, df, funding_rows,
                 interval=interval, oi_period=oi_period, recent=push_recent,
             )
+
+        # 시장-베타 인덱스(BTC/ETH) OHLCV 적재 — 거래 아님, read-only 인덱스(P5a)
+        idx_syms = _INDEX_SYMBOLS if index_symbols is None else index_symbols
+        if idx_syms:
+            idx_data = dl.collect_universe(
+                client, idx_syms, interval=interval, oi_period=oi_period,
+                limit=limit, out_dir=out_dir,
+            )
+            for sym, df in idx_data.items():
+                funding_rows = fetch_funding(client, sym, limit=limit)
+                pushed[f"[idx]{sym}"] = push_to_supabase(
+                    persist, sym, df, funding_rows,
+                    interval=interval, oi_period=oi_period, recent=push_recent,
+                )
+
+        # CMC 글로벌 지표(도미넌스·총시총·F&G) 1행 적재(P5a)
+        if push_global:
+            push_market_global(persist, cmc or _build_cmc())
+
         try:
             persist.flush_outbox()       # 이전 장애로 밀린 분 재전송
         except Exception as e:  # noqa: BLE001
