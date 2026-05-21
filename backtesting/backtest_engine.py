@@ -110,6 +110,11 @@ class BacktestConfig:
     breakout_atr_stop: float = 2.0             # 손절 = 진입 ∓ N·ATR
     breakout_atr_target: float = 4.0           # 목표 = 진입 ± N·ATR
 
+    # 돌파 청산 정교화(opt-in, 기본 off → 기존 TP/SL/시간스톱 동작 불변).
+    # True 면 고정 TP 대신 ATR 샹들리에 트레일(수익을 끝까지 끌되 되돌림에 청산).
+    breakout_trail_exit: bool = False
+    breakout_trail_atr_mult: float = 3.0       # 트레일 = 최고가 − N·ATR (LONG)
+
     # 최대 보유 봉 수(시간 스톱). 돌파처럼 추세추종은 길게 끌 수 있어 설정화.
     time_stop_bars: int = DEFAULT_TIME_STOP_BARS
 
@@ -682,6 +687,18 @@ class BacktestEngine:
         exit_reason: Optional[str] = None
         bars_held = 0
 
+        # 돌파 청산 정교화(opt-in): ATR 샹들리에 트레일 — 고정 TP 대신 수익을
+        # 끝까지 끌되 되돌림(최고가−N·ATR)에 청산. 초기 손절(sl_price)에서 시작해
+        # 유리한 방향으로만 ratchet. 기존 전략/기본값은 trail_on=False 로 불변.
+        trail_on = (
+            self.config.breakout_trail_exit
+            and signal.setup_tag.startswith("breakout")
+            and signal.atr > 0
+        )
+        trail_mult = self.config.breakout_trail_atr_mult
+        trail_stop = signal.sl_price
+        extreme = signal.entry_price
+
         for pos in range(start_pos, len(idx_list)):
             ts = idx_list[pos]
             row = df.iloc[pos]
@@ -701,19 +718,37 @@ class BacktestEngine:
 
             # TP/SL 체크 — 한 봉 내 동시 충족 시 SL 우선 (보수적).
             if signal.action == "LONG":
-                if low <= signal.sl_price:
-                    exit_price, exit_reason, exit_ts = signal.sl_price, "SL", ts
-                    break
-                if high >= signal.tp_price:
-                    exit_price, exit_reason, exit_ts = signal.tp_price, "TP", ts
-                    break
+                if trail_on:
+                    extreme = max(extreme, high)
+                    trail_stop = max(trail_stop, extreme - trail_mult * signal.atr)
+                    if low <= trail_stop:
+                        exit_price = trail_stop
+                        exit_reason = "TRAIL" if trail_stop > signal.sl_price else "SL"
+                        exit_ts = ts
+                        break
+                else:
+                    if low <= signal.sl_price:
+                        exit_price, exit_reason, exit_ts = signal.sl_price, "SL", ts
+                        break
+                    if high >= signal.tp_price:
+                        exit_price, exit_reason, exit_ts = signal.tp_price, "TP", ts
+                        break
             else:  # SHORT
-                if high >= signal.sl_price:
-                    exit_price, exit_reason, exit_ts = signal.sl_price, "SL", ts
-                    break
-                if low <= signal.tp_price:
-                    exit_price, exit_reason, exit_ts = signal.tp_price, "TP", ts
-                    break
+                if trail_on:
+                    extreme = min(extreme, low)
+                    trail_stop = min(trail_stop, extreme + trail_mult * signal.atr)
+                    if high >= trail_stop:
+                        exit_price = trail_stop
+                        exit_reason = "TRAIL" if trail_stop < signal.sl_price else "SL"
+                        exit_ts = ts
+                        break
+                else:
+                    if high >= signal.sl_price:
+                        exit_price, exit_reason, exit_ts = signal.sl_price, "SL", ts
+                        break
+                    if low <= signal.tp_price:
+                        exit_price, exit_reason, exit_ts = signal.tp_price, "TP", ts
+                        break
 
             # 시간 스톱 (config.time_stop_bars, 기본 DEFAULT_TIME_STOP_BARS)
             if bars_held >= self.config.time_stop_bars:

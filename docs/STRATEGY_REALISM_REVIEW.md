@@ -167,9 +167,13 @@
   CMC `get_global_metrics`(도미넌스·총시총·F&G) → 신규 `market_global` 테이블. 백필 검증: 인덱스
   ohlcv 1,000행(BTC+ETH), market_global 1행(BTC dom 60.1%·총시총 $2.57조·F&G 39). 단위테스트
   +4, 전체 365 passed. 스케줄 수집이 매시간 인덱스·글로벌도 자동 누적.
+- ✅ **#2 돌파 청산 정교화 완료(구현, 기본 OFF)** — `BacktestConfig.breakout_trail_exit`(ATR 샹들리에
+  트레일, opt-in). **검증 결과 21일 표본에선 트레일이 더 나쁨**(승률 41%→23%, expR +0.04→−0.26):
+  지속 추세 없는 단기 구간에서 휩쏘. **기본 고정 TP4/SL2 유지**, 트레일 채택은 P4 walk-forward에서
+  결정. 기준선 `backtest_runs`(`breakout_trail_vs_fixed_20260521`) 기록. 단위테스트 +2, 전체 367 passed.
 - 🔄 **P5b 대기** — BTC risk-off 게이트는 BTC 데이터 축적/백테스트 후(expectancy↑·MDD↓ 입증 시).
-- ▶️ **다음 우선순위(확정 순서)**: ① **돌파 청산 정교화**(반대 채널 트레일, 데이터 불필요·즉시) →
-  ② P5b BTC risk-off 게이트(백테스트) → ③ P3 펀딩 페이드 → ④ P4 walk-forward(시간 대기).
+- ▶️ **남은 우선순위**: ③ **P5b BTC risk-off 게이트**(BTC 데이터로 백테스트) → ④ P3 펀딩 페이드
+  → ⑤ P4 walk-forward(시간 대기). #1·#2 및 모든 데이터 누적은 완료.
 
 > 실거래 실행/주문은 전 단계에서 **금지(HOLD)**. 코드 변경은 본 계획 범위 내에서 단계별·검증 후 진행.
 

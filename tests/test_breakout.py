@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 
 import pandas as pd
 
-from backtesting.backtest_engine import BacktestConfig, BacktestEngine
+from backtesting.backtest_engine import BacktestConfig, BacktestEngine, Signal
 from strategy import breakout as bo
 
 
@@ -134,3 +134,50 @@ def test_engine_breakout_generates_trades():
     result = BacktestEngine(cfg).run({"TESTUSDT": _uptrend_df()})
     assert result.total_trades >= 1
     assert any(tag.startswith("breakout_") for tag in result.setup_stats)
+
+
+def _sig(entry_ts, atr=1.0):
+    return Signal(
+        symbol="X", action="LONG", setup_tag="breakout_long", regime="TREND_UP",
+        confidence=0.7, entry_ts=entry_ts, entry_price=100.0,
+        tp_price=200.0, sl_price=98.0, atr=atr, pair_tier=2, size_usdt=100.0,
+    )
+
+
+def test_simulate_trade_trail_exit():
+    """breakout_trail_exit=True → ATR 샹들리에 트레일로 청산(TRAIL)."""
+    idx = pd.date_range("2026-01-01", periods=5, freq="1h", tz="UTC")
+    df = pd.DataFrame([
+        {"open": 99, "high": 99, "low": 99, "close": 99, "volume": 1},      # 진입 전
+        {"open": 100, "high": 101, "low": 99.5, "close": 100.5, "volume": 1},  # 진입봉
+        {"open": 100.5, "high": 105, "low": 100, "close": 104, "volume": 1},   # 상승(트레일 ratchet)
+        {"open": 104, "high": 110, "low": 103, "close": 109, "volume": 1},
+        {"open": 109, "high": 109, "low": 104, "close": 105, "volume": 1},     # 되돌림 → 트레일 청산
+    ], index=idx)
+    cfg = BacktestConfig(strategy="breakout", breakout_trail_exit=True,
+                         breakout_trail_atr_mult=3.0, time_stop_bars=999,
+                         apply_funding=False)
+    eng = BacktestEngine(cfg)
+    eng._candles_by_pair = {"X": df}
+    eng._bar_seconds = 3600.0
+    trade = eng._simulate_trade(_sig(idx[1]))
+    assert trade is not None
+    assert trade.exit_reason == "TRAIL"
+
+
+def test_simulate_trade_trail_off_uses_fixed_tp_sl():
+    """trail off(기본) → 고정 TP/SL 동작 불변(회귀 가드)."""
+    idx = pd.date_range("2026-01-01", periods=4, freq="1h", tz="UTC")
+    df = pd.DataFrame([
+        {"open": 99, "high": 99, "low": 99, "close": 99, "volume": 1},
+        {"open": 100, "high": 101, "low": 99, "close": 100, "volume": 1},   # 진입
+        {"open": 100, "high": 100, "low": 97, "close": 97.5, "volume": 1},  # SL(98) 히트
+        {"open": 97, "high": 98, "low": 96, "close": 97, "volume": 1},
+    ], index=idx)
+    cfg = BacktestConfig(strategy="breakout", breakout_trail_exit=False,
+                         time_stop_bars=999, apply_funding=False)
+    eng = BacktestEngine(cfg)
+    eng._candles_by_pair = {"X": df}
+    eng._bar_seconds = 3600.0
+    trade = eng._simulate_trade(_sig(idx[1]))
+    assert trade.exit_reason == "SL"
