@@ -61,6 +61,7 @@ from config.settings import (
     REGIME_TRADING_PARAMS,
     RISK_RULES,
     SIZING_CONFIG,
+    STRATEGY_CONFIG,
     SYSTEM_CONFIG,
     TRADE_EXECUTOR_CONFIG,
     WEEKLY_ANALYST_CONFIG,
@@ -75,6 +76,7 @@ from data.oi_scanner import OIScanner
 from db.init_db import init_db
 from ops.system_health_monitor import SystemHealthMonitor
 from sizing.dynamic_sizer import DynamicPositionSizer
+from strategy.breakout import BreakoutConfig, evaluate_breakout
 from strategy.cost_guard import CostGuard
 from strategy.oi_filter import GRADE_C_DANGER, OIFilter
 from strategy.pair_whitelist import PairWhitelist
@@ -239,6 +241,7 @@ class MainBot:
         openai_client=None,
         telegram=None,
         cmc_client=None,
+        active_strategy: str | None = None,
     ) -> None:
         """봇 초기화 — 14개 모듈 조립.
 
@@ -278,6 +281,16 @@ class MainBot:
             top_n=OISCANNER_CONFIG.top_n,
             oi_lookback_period=OISCANNER_CONFIG.oi_lookback_period,
             oi_lookback_count=OISCANNER_CONFIG.oi_lookback_count,
+        )
+
+        # ── 활성 전략 선택 (P2): "oi_surge"(기본) | "breakout" ──
+        self.active_strategy = active_strategy or STRATEGY_CONFIG.active_strategy
+        self.breakout_cfg = BreakoutConfig(
+            donchian_entry=STRATEGY_CONFIG.breakout_donchian,
+            adx_trend_min=STRATEGY_CONFIG.breakout_adx_min,
+            ema_period=STRATEGY_CONFIG.breakout_ema,
+            atr_stop_mult=STRATEGY_CONFIG.breakout_atr_stop,
+            atr_target_mult=STRATEGY_CONFIG.breakout_atr_target,
         )
 
         # ── 전략 / 사이징 ──
@@ -697,13 +710,15 @@ class MainBot:
             capital=capital_snapshot.wallet_balance,
             regime=regime_state.regime,
         )
-        candidates = await self.oi_scanner.scan(active_pairs)
         self._scan_count += 1
-        self._last_candidate_count = len(candidates)
-        self._candidate_total += len(candidates)
-
-        for candidate in candidates:
-            await self._handle_signal(candidate, regime_state, capital_snapshot)
+        if self.active_strategy == "breakout":
+            await self._scan_breakout(active_pairs, regime_state, capital_snapshot)
+        else:
+            candidates = await self.oi_scanner.scan(active_pairs)
+            self._last_candidate_count = len(candidates)
+            self._candidate_total += len(candidates)
+            for candidate in candidates:
+                await self._handle_signal(candidate, regime_state, capital_snapshot)
 
         # ── 주기적 배치 트리거 ──
         await self._maybe_run_weekly()
@@ -742,19 +757,54 @@ class MainBot:
             self.shadow.record_blocked("quality_gate", candidate, quality)
             return
 
+        # 4~7) 공유 게이트 스택(리스크→사이징→CostGuard→실행)
+        await self._execute_decision(
+            symbol=symbol,
+            action=quality.action,
+            entry_price=quality.entry_price,
+            tp=quality.tp,
+            sl=quality.sl,
+            setup_tag=quality.setup_tag,
+            score=quality.score,
+            regime_state=regime_state,
+            capital_snapshot=capital_snapshot,
+            candidate=candidate,
+        )
+
+    async def _execute_decision(
+        self,
+        *,
+        symbol: str,
+        action: str,
+        entry_price: float,
+        tp: float,
+        sl: float,
+        setup_tag: str,
+        score,
+        regime_state,
+        capital_snapshot,
+        candidate=None,
+    ) -> None:
+        """공유 다운스트림 게이트 — oi_surge / breakout 공통 (부록 E-5-2 단계 4~7).
+
+        신호원이 결정한 action/entry/tp/sl/setup_tag 를 받아 동일한 게이트(리스크→
+        사이징→CostGuard→실행)로 처리한다. 두 전략의 게이트 동작이 갈라지지 않도록
+        단일 소스로 유지한다. candidate 는 shadow 차단 기록용(없으면 생략).
+        """
+        params = REGIME_TRADING_PARAMS[regime_state.regime]
+
         # 4) 리스크 한도 (capital_manager 자동 조회)
         if not await self.risk_manager.check_all():
             logger.info("[Risk] %s 리스크 한도 위반", symbol)
-            self.shadow.record_blocked("risk_manager", candidate, None)
+            if candidate is not None:
+                self.shadow.record_blocked("risk_manager", candidate, None)
             return
 
-        # 5) 사이징 — available_balance 기준 (부록 E-5-2)
-        #    + LIVE_PROBE_BUDGET_USDT cap: 소액 실거래 연결 검증 동안 신규 거래
-        #      예산을 제한한다. capital = min(available, live_probe_budget).
+        # 5) 사이징 — available_balance 기준 + LIVE_PROBE_BUDGET cap
         win_rate, sample_count = self.expectancy.get_win_rate(
-            quality.setup_tag, return_count=True
+            setup_tag, return_count=True
         )
-        avg_win, avg_loss = self.expectancy.get_avg_R(quality.setup_tag)
+        avg_win, avg_loss = self.expectancy.get_avg_R(setup_tag)
         budget_cap = min(
             capital_snapshot.available_balance,
             LIVE_PROBE_CONFIG.live_probe_budget_usdt,
@@ -773,8 +823,6 @@ class MainBot:
                 "[Sizer] %s 최소 명목가치 미달: $%.2f", symbol, sizing.size_usdt
             )
             return
-
-        # 예산/마진 초과 검증 (부록 E-5-2 + LIVE_PROBE_BUDGET cap)
         if sizing.size_usdt > budget_cap:
             logger.warning(
                 "[Sizer] %s 사이즈 $%.2f > budget_cap $%.2f → 차단",
@@ -785,17 +833,18 @@ class MainBot:
         # 6) CostGuard
         pair_tier = self.pair_wl.get_tier(symbol)
         cost_check = self.cost_guard.check(
-            setup_tag=quality.setup_tag,
-            entry_price=quality.entry_price,
-            tp_price=quality.tp,
-            sl_price=quality.sl,
+            setup_tag=setup_tag,
+            entry_price=entry_price,
+            tp_price=tp,
+            sl_price=sl,
             position_usdt=sizing.size_usdt,
-            action=quality.action,
+            action=action,
             pair_tier=pair_tier,
         )
         if not cost_check.passed:
             logger.info("[CostGuard] %s 차단: %s", symbol, cost_check.reason)
-            self.shadow.record_blocked("cost_guard", candidate, cost_check)
+            if candidate is not None:
+                self.shadow.record_blocked("cost_guard", candidate, cost_check)
             return
 
         # 7) 실행
@@ -803,12 +852,12 @@ class MainBot:
         leverage = max(1, min(params.max_leverage, max_lev_tier))
         decision = {
             "symbol": symbol,
-            "action": quality.action,
-            "entry_price": quality.entry_price,
-            "tp": quality.tp,
-            "sl": quality.sl,
-            "setup_tag": quality.setup_tag,
-            "score": quality.score,
+            "action": action,
+            "entry_price": entry_price,
+            "tp": tp,
+            "sl": sl,
+            "setup_tag": setup_tag,
+            "score": score,
             "size_usdt": sizing.size_usdt,
             "leverage": leverage,
             "regime": regime_state.regime,
@@ -834,11 +883,11 @@ class MainBot:
                 tp_order_id=result.get("tp_order_id"),
             )
             self.shadow.record(strategy_name=_SHADOW_STRATEGY, decision=decision)
-            entry_actual = result.get("entry_price_actual", quality.entry_price)
+            entry_actual = result.get("entry_price_actual", entry_price)
             qty = result.get("quantity")
             # 진입 즉시 알림 (요구 4)
             await self.telegram.send(
-                f"✅ 진입: {symbol} {quality.action}\n"
+                f"✅ 진입: {symbol} {action}\n"
                 f"진입가: {entry_actual}\n"
                 f"수량: {qty}\n"
                 f"notional: ${sizing.size_usdt:.2f}\n"
@@ -850,8 +899,8 @@ class MainBot:
             # 보호주문 등록 알림 (요구 5) — STOP/TP id + trigger
             await self.telegram.send(
                 f"🛡️ 보호주문 등록: {symbol}\n"
-                f"sl_order_id: {result.get('sl_order_id')} (STOP trigger {quality.sl})\n"
-                f"tp_order_id: {result.get('tp_order_id')} (TP trigger {quality.tp})"
+                f"sl_order_id: {result.get('sl_order_id')} (STOP trigger {sl})\n"
+                f"tp_order_id: {result.get('tp_order_id')} (TP trigger {tp})"
             )
         elif result.get("critical"):
             # v3.1.2 critical 사유는 여러 가지 — reason 으로 운영자에게 명확히 전달:
@@ -864,6 +913,60 @@ class MainBot:
             )
         else:
             logger.warning("[Main] %s 진입 실패: %s", symbol, result.get("reason"))
+
+    async def _scan_breakout(
+        self, active_pairs, regime_state, capital_snapshot
+    ) -> None:
+        """돌파 전략 라이브 스캔 — 활성 페어별 Donchian/ATR 돌파 평가 후 실행.
+
+        룩어헤드 차단: 마지막(형성중) 캔들을 제외한 마감봉만 evaluate_breakout 에
+        전달한다. 진입가는 현재가(형성중 캔들 종가). 보호종목/화이트리스트는
+        PairWhitelist.is_allowed 로 차단하고, 이후 게이트는 _execute_decision 공유.
+        """
+        self._last_candidate_count = 0
+        for symbol in active_pairs:
+            if not self.pair_wl.is_allowed(
+                symbol,
+                capital=capital_snapshot.wallet_balance,
+                regime=regime_state.regime,
+            ):
+                continue
+            candles = await self.collector.get_candles(
+                symbol,
+                STRATEGY_CONFIG.breakout_interval,
+                STRATEGY_CONFIG.breakout_limit,
+            )
+            if not candles or len(candles) < 2:
+                continue
+            closed = candles[:-1]   # 형성중 마지막 캔들 제외(룩어헤드 차단)
+            sig = evaluate_breakout(closed, self.breakout_cfg)
+            if sig is None:
+                continue
+            self._last_candidate_count += 1
+            self._candidate_total += 1
+            entry_price = float(candles[-1][3])   # 현재가(형성중 종가)
+            if entry_price <= 0 or sig.atr <= 0:
+                continue
+            if sig.action == "LONG":
+                tp = entry_price + self.breakout_cfg.atr_target_mult * sig.atr
+                sl = entry_price - self.breakout_cfg.atr_stop_mult * sig.atr
+            else:
+                tp = entry_price - self.breakout_cfg.atr_target_mult * sig.atr
+                sl = entry_price + self.breakout_cfg.atr_stop_mult * sig.atr
+            if sl <= 0 or tp <= 0:
+                continue
+            await self._execute_decision(
+                symbol=symbol,
+                action=sig.action,
+                entry_price=entry_price,
+                tp=tp,
+                sl=sl,
+                setup_tag=f"breakout_{sig.action.lower()}",
+                score=int(sig.adx),
+                regime_state=regime_state,
+                capital_snapshot=capital_snapshot,
+                candidate=None,
+            )
 
     # =================================================================
     # 포지션 관리 / 배치 트리거

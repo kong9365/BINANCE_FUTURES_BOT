@@ -140,7 +140,13 @@
   0.82–1.06(저승률·고R 추세추종 프로파일) — OI-급증(전 조합 음수)의 질적 반전. **단
   13–19거래/단일레짐 = 통계적 검증 아님**(P4 필요). 기준선 `backtest_runs`
   (`p1_breakout_baseline_20260521`)에 기록(회귀 가드). (커밋 `d673e13`)
-- ▶️ 다음: **P2 라이브 통합**(돌파 신호를 결정 경로에 연결, 기존 게이트·보호종목·HOLD 유지)
-  또는 **P4 데이터 누적 가속**(돌파 검증용 OHLCV/펀딩 장기 적재).
+- ✅ **P2 완료** — 라이브 활성 전략 선택자(`StrategyConfig.active_strategy`, env `ACTIVE_STRATEGY`,
+  기본 oi_surge로 기존 동작 불변) + `main_7590._scan_breakout`(형성중 캔들 제외=룩어헤드 차단,
+  `collector.get_candles`로 실시간 평가). 게이트 ④~⑦(리스크→사이징→CostGuard→실행)을 공유
+  `_execute_decision`로 추출해 oi_surge/breakout가 **동일 게이트·보호종목·예산cap** 통과(괴리
+  방지). 통합테스트 5 + 기존 39 무회귀, 전체 354 passed. dry-run 스모크(ACTIVE_STRATEGY=breakout)
+  exit 0·에러 0·정상종료. **실거래 GO HOLD 유지.** (커밋 예정)
+- ▶️ 다음: **P4 데이터 누적 가속**(돌파 검증용 OHLCV/펀딩 장기 적재 → walk-forward) 또는
+  **P3 펀딩 페이드** / 돌파 청산 정교화(반대 채널 트레일).
 
 > 실거래 실행/주문은 전 단계에서 **금지(HOLD)**. 코드 변경은 본 계획 범위 내에서 단계별·검증 후 진행.

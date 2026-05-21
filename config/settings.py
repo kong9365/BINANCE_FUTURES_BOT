@@ -393,3 +393,36 @@ class OIScannerConfig:
 
 
 OISCANNER_CONFIG = OIScannerConfig()
+
+
+# ─────────────────────────────────────────────────────
+# 전략 선택 (P2 — 라이브 활성 매수 전략)
+# ─────────────────────────────────────────────────────
+@dataclass
+class StrategyConfig:
+    """라이브 활성 매수 전략 선택 + 돌파(Donchian/ATR) 파라미터.
+
+    active_strategy 기본 "oi_surge"(기존 동작 유지). 환경변수 ACTIVE_STRATEGY 로
+    "breakout" 선택 시 strategy/breakout(Donchian/ATR + ADX·200EMA 레짐 게이트)을
+    라이브 신호원으로 사용한다. 다운스트림 게이트(PairWhitelist/보호종목/RiskManager/
+    CostGuard/사이징/Executor)는 두 전략이 동일하게 통과한다.
+    """
+
+    active_strategy: str = "oi_surge"   # "oi_surge" | "breakout"
+    breakout_interval: str = "1h"
+    breakout_limit: int = 250           # ema200 + 여유(형성중 캔들 1개 제외 포함)
+    breakout_donchian: int = 20
+    breakout_adx_min: float = 25.0
+    breakout_ema: int = 200
+    breakout_atr_stop: float = 2.0
+    breakout_atr_target: float = 4.0
+
+
+def _resolve_active_strategy() -> str:
+    """환경변수 ACTIVE_STRATEGY override (유효값만, 그 외 기본 oi_surge)."""
+    import os
+    v = (os.environ.get("ACTIVE_STRATEGY") or "").strip().lower()
+    return v if v in ("oi_surge", "breakout") else "oi_surge"
+
+
+STRATEGY_CONFIG = StrategyConfig(active_strategy=_resolve_active_strategy())
