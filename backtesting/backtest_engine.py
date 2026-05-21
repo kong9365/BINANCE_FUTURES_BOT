@@ -50,6 +50,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 
 from sizing.dynamic_sizer import DynamicPositionSizer
+from strategy.breakout import BreakoutConfig, evaluate_breakout
 from strategy.cost_guard import CostGuard
 from strategy.regime_detector import Regime, RegimeDetector
 
@@ -95,11 +96,22 @@ class BacktestConfig:
     pairs: List[str] = field(default_factory=lambda: ["BTCUSDT", "ETHUSDT"])
 
     # 전략 선택: "trend_follow"(레짐 추세추종, 기존) / "oi_surge"(라이브 OIScanner 재현)
+    #          / "breakout"(Donchian/ATR 돌파 + ADX·200EMA 레짐 게이트, P1)
     strategy: str = "trend_follow"
     # oi_surge 전용 — 라이브 OIScanner 와 동일 의미. open_interest 컬럼 필요.
     oi_change_threshold_pct: float = 5.0       # OI 변화율 하한(%)
     price_change_threshold_pct: float = 2.0    # 가격 변화율 하한(절댓값, %)
     oi_lookback_bars: int = 1                  # 현재 vs N봉 전 OI/가격 비교
+
+    # breakout 전용 — strategy/breakout.BreakoutConfig 로 매핑(단일 소스 공유).
+    breakout_donchian: int = 20                # 진입 채널 기간
+    breakout_adx_min: float = 25.0             # 추세 게이트(ADX 하한)
+    breakout_ema: int = 200                    # 장기 추세 편향 EMA
+    breakout_atr_stop: float = 2.0             # 손절 = 진입 ∓ N·ATR
+    breakout_atr_target: float = 4.0           # 목표 = 진입 ± N·ATR
+
+    # 최대 보유 봉 수(시간 스톱). 돌파처럼 추세추종은 길게 끌 수 있어 설정화.
+    time_stop_bars: int = DEFAULT_TIME_STOP_BARS
 
     # 비용 가정 (보수적, §10-2)
     maker_fee: float = 0.00018
@@ -227,6 +239,14 @@ class BacktestEngine:
             maker_fee_rate=config.maker_fee,
         )
         self.sizer = DynamicPositionSizer()
+        # 돌파 전략 파라미터(라이브와 동일 로직 공유). stateless 라 _reset 불필요.
+        self.breakout_cfg = BreakoutConfig(
+            donchian_entry=config.breakout_donchian,
+            adx_trend_min=config.breakout_adx_min,
+            ema_period=config.breakout_ema,
+            atr_stop_mult=config.breakout_atr_stop,
+            atr_target_mult=config.breakout_atr_target,
+        )
 
         # run() 내부 상태 (run() 진입 시 _reset 로 초기화)
         self._candles_by_pair: Dict[str, pd.DataFrame] = {}
@@ -425,6 +445,8 @@ class BacktestEngine:
         """
         if self.config.strategy == "oi_surge":
             return self._evaluate_oi_surge(symbol, ts, regime_state, equity)
+        if self.config.strategy == "breakout":
+            return self._evaluate_breakout(symbol, ts, regime_state, equity)
 
         if regime_state.regime == Regime.TREND_UP:
             action = "LONG"
@@ -571,6 +593,65 @@ class BacktestEngine:
             size_usdt=sizing.size_usdt,
         )
 
+    def _evaluate_breakout(
+        self, symbol: str, ts: Any, regime_state, equity: float
+    ) -> Optional[Signal]:
+        """Donchian/ATR 돌파 + ADX·200EMA 레짐 게이트 (strategy/breakout 공유 로직).
+
+        신호 판정은 ts 이전 마감봉만으로(룩어헤드 차단), 진입가는 봉 ts 의 open.
+        TP/SL 은 ATR 배수(BreakoutConfig.atr_target_mult / atr_stop_mult)로 산출 —
+        저승률·고R(우측꼬리) 추세추종 프로파일.
+        """
+        closed = self._get_candles_until(symbol, "1h", ts)
+        sig = evaluate_breakout(closed, self.breakout_cfg)
+        if sig is None:
+            return None
+
+        df = self._candles_by_pair[symbol]
+        if ts not in df.index:
+            return None
+        entry_price = float(df.at[ts, "open"])
+        if entry_price <= 0:
+            return None
+
+        atr = sig.atr
+        if sig.action == "LONG":
+            tp_price = entry_price + self.breakout_cfg.atr_target_mult * atr
+            sl_price = entry_price - self.breakout_cfg.atr_stop_mult * atr
+        else:  # SHORT
+            tp_price = entry_price - self.breakout_cfg.atr_target_mult * atr
+            sl_price = entry_price + self.breakout_cfg.atr_stop_mult * atr
+        if sl_price <= 0 or tp_price <= 0:
+            return None
+
+        pair_tier = PAIR_TIERS.get(symbol, 2)
+        sizing = self.sizer.calculate(
+            capital=equity,
+            win_rate=_DEFAULT_BACKTEST_WIN_RATE,
+            avg_win_R=_DEFAULT_BACKTEST_WIN_R,
+            avg_loss_R=_DEFAULT_BACKTEST_LOSS_R,
+            regime=regime_state.regime,
+            confidence=regime_state.confidence,
+            sample_count=0,
+        )
+        if sizing.size_usdt <= 0:
+            return None
+
+        return Signal(
+            symbol=symbol,
+            action=sig.action,
+            setup_tag=f"breakout_{sig.action.lower()}",
+            regime=regime_state.regime,
+            confidence=regime_state.confidence,
+            entry_ts=ts,
+            entry_price=entry_price,
+            tp_price=tp_price,
+            sl_price=sl_price,
+            atr=atr,
+            pair_tier=pair_tier,
+            size_usdt=sizing.size_usdt,
+        )
+
     # ── 거래 시뮬레이션 (단계 4·5) ──
     def _simulate_trade(self, signal: Signal) -> Optional[Trade]:
         """진입봉 ts 부터 순방향 스캔하여 TP/SL/시간스톱/데이터끝 청산을 결정.
@@ -634,8 +715,8 @@ class BacktestEngine:
                     exit_price, exit_reason, exit_ts = signal.tp_price, "TP", ts
                     break
 
-            # 시간 스톱
-            if bars_held >= DEFAULT_TIME_STOP_BARS:
+            # 시간 스톱 (config.time_stop_bars, 기본 DEFAULT_TIME_STOP_BARS)
+            if bars_held >= self.config.time_stop_bars:
                 exit_price, exit_reason, exit_ts = close, "TIME_STOP", ts
                 break
 
