@@ -141,6 +141,24 @@ class SupabasePersistence:
         conflict = on_conflict or _UPSERT_CONFLICT.get(table)
         return self._write("upsert", table, _normalize(row), conflict)
 
+    def insert_many(self, table: str, rows: List[Dict[str, Any]]) -> bool:
+        """배치 insert. 빈 리스트는 no-op(True)."""
+        if not rows:
+            return True
+        return self._write_many("insert_many", table, [_normalize(r) for r in rows])
+
+    def upsert_many(self, table: str, rows: List[Dict[str, Any]],
+                    on_conflict: Optional[str] = None) -> bool:
+        """배치 upsert(멱등 누적용). 빈 리스트는 no-op(True).
+
+        누적 테이블(oi_history/funding_history/ohlcv) 적재에 사용 — 재실행 시
+        UNIQUE 충돌은 갱신되어 중복이 생기지 않는다.
+        """
+        if not rows:
+            return True
+        conflict = on_conflict or _UPSERT_CONFLICT.get(table)
+        return self._write_many("upsert_many", table, [_normalize(r) for r in rows], conflict)
+
     # 편의 래퍼 (이후 단계에서 사용) ----------------------------------------
     def log_event(self, level: str, component: str, message: str,
                   context: Optional[Dict[str, Any]] = None) -> bool:
@@ -190,12 +208,28 @@ class SupabasePersistence:
         self._enqueue(op, table, payload, conflict, error="no client")
         return False
 
-    def _send(self, op: str, table: str, payload: Dict[str, Any],
+    def _write_many(self, op: str, table: str, rows: List[Dict[str, Any]],
+                    conflict: Optional[str] = None) -> bool:
+        """배치 쓰기. 실패/무클라이언트 시 배치 전체를 outbox 1건으로 적재."""
+        if self.client is not None:
+            try:
+                self._send(op, table, rows, conflict)
+                return True
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[Persistence] %s %s(%d행) 실패 → outbox 적재: %s",
+                               op, table, len(rows), e)
+                self._enqueue(op, table, rows, conflict, error=str(e))
+                return False
+        self._enqueue(op, table, rows, conflict, error="no client")
+        return False
+
+    def _send(self, op: str, table: str, payload: Any,
               conflict: Optional[str]) -> None:
+        """단건/배치 전송. payload 는 dict(단건) 또는 list(배치) — supabase-py 가 둘 다 수용."""
         q = self.client.table(table)
-        if op == "upsert":
+        if op in ("upsert", "upsert_many"):
             (q.upsert(payload, on_conflict=conflict) if conflict else q.upsert(payload)).execute()
-        else:
+        else:  # insert / insert_many
             q.insert(payload).execute()
 
     def _enqueue(self, op: str, table: str, payload: Dict[str, Any],

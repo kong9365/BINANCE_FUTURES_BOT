@@ -31,11 +31,16 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from backtesting import data_loader as dl
 
 logger = logging.getLogger(__name__)
+
+# 시간별 스케줄 실행 시 Supabase 에 적재할 최근 봉 수(겹침 포함). UNIQUE upsert 라
+# 멱등 — 1시간 갭 + 여유를 덮는다. --backfill 은 전체를 1회 시딩.
+_DEFAULT_PUSH_RECENT = 48
 
 # 기본 수집 유니버스 — 유동성 높은 비보호 USDT 무기한(보호종목 제외).
 _DEFAULT_OI_COLLECT_SYMBOLS: List[str] = [
@@ -64,6 +69,73 @@ def _build_live_client():
     )
 
 
+def _build_persistence():
+    """Supabase 주저장 + 로컬 폴백 어댑터(env 기반). 키 미설정 시 outbox 전용."""
+    from data.persistence import SupabasePersistence
+    return SupabasePersistence()
+
+
+def fetch_funding(client, symbol: str, limit: int = 500) -> List[dict]:
+    """심볼 펀딩비 이력을 funding_history 행 형식으로 반환. 실패 시 빈 리스트."""
+    try:
+        raw = client.futures_funding_rate(symbol=symbol, limit=limit)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[CollectOI] %s 펀딩 이력 조회 실패: %s", symbol, e)
+        return []
+    rows: List[dict] = []
+    for item in raw or []:
+        try:
+            ts = datetime.fromtimestamp(
+                int(item["fundingTime"]) / 1000.0, tz=timezone.utc
+            )
+            rows.append({
+                "symbol": symbol, "ts": ts.isoformat(),
+                "funding_rate": float(item["fundingRate"]),
+            })
+        except (KeyError, ValueError, TypeError):
+            continue
+    return rows
+
+
+def _df_rows(symbol: str, df, interval: str, oi_period: str):
+    """DataFrame(OHLCV+open_interest, ts index) → (ohlcv 행, oi 행) 리스트."""
+    ohlcv_rows: List[dict] = []
+    oi_rows: List[dict] = []
+    has_oi = "open_interest" in df.columns
+    for ts, r in df.iterrows():
+        ts_iso = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
+        ohlcv_rows.append({
+            "symbol": symbol, "interval": interval, "ts": ts_iso,
+            "open": float(r["open"]), "high": float(r["high"]),
+            "low": float(r["low"]), "close": float(r["close"]),
+            "volume": float(r["volume"]),
+        })
+        if has_oi:
+            oi_rows.append({
+                "symbol": symbol, "ts": ts_iso,
+                "open_interest": float(r["open_interest"]), "period": oi_period,
+            })
+    return ohlcv_rows, oi_rows
+
+
+def push_to_supabase(persist, symbol, df, funding_rows, *, interval="1h",
+                     oi_period="1h", recent: Optional[int] = _DEFAULT_PUSH_RECENT
+                     ) -> Dict[str, int]:
+    """심볼 1종의 OHLCV/OI/펀딩을 Supabase 에 멱등(upsert) 적재.
+
+    recent 지정 시 최근 N봉만(겹침 idempotent). None 이면 전체(backfill).
+    """
+    ohlcv_rows, oi_rows = _df_rows(symbol, df, interval, oi_period)
+    if recent is not None and recent > 0:
+        ohlcv_rows = ohlcv_rows[-recent:]
+        oi_rows = oi_rows[-recent:]
+        funding_rows = funding_rows[-recent:]
+    persist.upsert_many("ohlcv", ohlcv_rows)
+    persist.upsert_many("oi_history", oi_rows)
+    persist.upsert_many("funding_history", funding_rows)
+    return {"ohlcv": len(ohlcv_rows), "oi": len(oi_rows), "funding": len(funding_rows)}
+
+
 def collect_once(
     interval: str = "1h",
     oi_period: str = "1h",
@@ -71,14 +143,20 @@ def collect_once(
     symbols: Optional[List[str]] = None,
     client=None,
     out_dir=dl.DEFAULT_CACHE_DIR,
+    persist=None,
+    push_supabase: bool = True,
+    push_recent: Optional[int] = _DEFAULT_PUSH_RECENT,
 ) -> Dict[str, int]:
-    """1회 수집 패스 — 유니버스 OI+OHLCV 를 받아 캐시에 누적하고 행수 요약 반환.
+    """1회 수집 패스 — 유니버스 OI+OHLCV 를 캐시에 누적하고 Supabase 에 적재.
 
     Args:
         interval/oi_period/limit: data_loader.collect_universe 인자.
         symbols: 수집 종목(None 이면 resolve_symbols()).
         client: 주입 클라이언트(None 이면 live read-only 생성). 테스트는 mock 주입.
-        out_dir: 저장 디렉토리(기본 backtests/cache/, gitignore).
+        out_dir: 로컬 CSV 캐시 디렉토리(기본 backtests/cache/, gitignore).
+        persist: SupabasePersistence 주입(None 이면 env 기반 생성). 테스트는 mock.
+        push_supabase: True 면 OHLCV/OI/펀딩을 Supabase 에 멱등 적재.
+        push_recent: 적재할 최근 봉 수(None 이면 전체 backfill).
 
     Returns:
         {symbol: 누적 행수}.
@@ -91,6 +169,22 @@ def collect_once(
     )
     summary = {k: len(v) for k, v in data.items()}
     logger.info("[CollectOI] 수집 완료(%d종목): %s", len(summary), summary)
+
+    if push_supabase:
+        persist = persist or _build_persistence()
+        pushed: Dict[str, dict] = {}
+        for sym, df in data.items():
+            funding_rows = fetch_funding(client, sym, limit=limit)
+            pushed[sym] = push_to_supabase(
+                persist, sym, df, funding_rows,
+                interval=interval, oi_period=oi_period, recent=push_recent,
+            )
+        try:
+            persist.flush_outbox()       # 이전 장애로 밀린 분 재전송
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[CollectOI] outbox flush 실패(무시): %s", e)
+        logger.info("[CollectOI] Supabase 적재: %s", pushed)
+
     return summary
 
 
@@ -107,14 +201,20 @@ def main() -> None:
     except ImportError:
         logger.warning("[CollectOI] python-dotenv 미설치 — 환경변수 직접 export 필요")
 
-    ap = argparse.ArgumentParser(description="OI+OHLCV 누적 수집")
+    ap = argparse.ArgumentParser(description="OI+OHLCV+펀딩 누적 수집 (CSV + Supabase)")
     ap.add_argument("--interval", default="1h")
     ap.add_argument("--oi-period", default="1h")
     ap.add_argument("--limit", type=int, default=500)
+    ap.add_argument("--no-supabase", action="store_true",
+                    help="Supabase 적재 비활성화(로컬 CSV 캐시만)")
+    ap.add_argument("--backfill", action="store_true",
+                    help="최근 N봉이 아니라 수집 전체를 Supabase 에 1회 시딩")
     args = ap.parse_args()
 
     summary = collect_once(
-        interval=args.interval, oi_period=args.oi_period, limit=args.limit
+        interval=args.interval, oi_period=args.oi_period, limit=args.limit,
+        push_supabase=not args.no_supabase,
+        push_recent=None if args.backfill else _DEFAULT_PUSH_RECENT,
     )
     print(f"OI collection done ({len(summary)} symbols): {summary}")
 

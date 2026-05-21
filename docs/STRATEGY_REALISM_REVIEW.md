@@ -146,7 +146,11 @@
   `_execute_decision`로 추출해 oi_surge/breakout가 **동일 게이트·보호종목·예산cap** 통과(괴리
   방지). 통합테스트 5 + 기존 39 무회귀, 전체 354 passed. dry-run 스모크(ACTIVE_STRATEGY=breakout)
   exit 0·에러 0·정상종료. **실거래 GO HOLD 유지.** (커밋 예정)
-- ▶️ 다음: **P4 데이터 누적 가속**(돌파 검증용 OHLCV/펀딩 장기 적재 → walk-forward) 또는
-  **P3 펀딩 페이드** / 돌파 청산 정교화(반대 채널 트레일).
+- 🔄 **P4 진행 중** — **데이터 누적 확장 완료**: `collect_oi` 가 OHLCV/OI/펀딩을 Supabase
+  (`ohlcv`/`oi_history`/`funding_history`)에 멱등(upsert) 적재(persistence 배치 `upsert_many`,
+  스케줄 실행은 최근 48봉, `--backfill` 전체 시딩). 백필 검증: ohlcv 6,036 / oi 6,036 /
+  funding 2,400행(12종목, 2026-04-30~05-21) Supabase 적재 확인. 단위테스트 +7, 전체 361 passed.
+  **남은 것: 수개월 누적 후 walk-forward(거래≥200, OOS)** — 시간 경과 대기(스케줄 자동 누적).
+- ▶️ 선택: **P3 펀딩 페이드**(횡보 모드) / 돌파 청산 정교화(반대 채널 트레일) — 데이터 축적과 병행 가능.
 
 > 실거래 실행/주문은 전 단계에서 **금지(HOLD)**. 코드 변경은 본 계획 범위 내에서 단계별·검증 후 진행.

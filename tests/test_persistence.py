@@ -119,3 +119,37 @@ def test_datetime_normalized_to_iso(tmp_path):
     p.insert("equity_snapshots", {"ts": dt, "wallet_balance": 100.0})
     payload = client.table.return_value.insert.call_args[0][0]
     assert isinstance(payload["ts"], str) and payload["ts"].startswith("2026-05-21T12:00")
+
+
+def test_upsert_many_success_batches(tmp_path):
+    client = _ok_client()
+    p = _p(client, tmp_path)
+    rows = [{"symbol": "SOLUSDT", "ts": "t1", "open_interest": 1.0, "period": "1h"},
+            {"symbol": "SOLUSDT", "ts": "t2", "open_interest": 2.0, "period": "1h"}]
+    assert p.upsert_many("oi_history", rows) is True
+    client.table.assert_called_with("oi_history")
+    # 단일 배치 호출 + on_conflict 키 전달
+    args, kwargs = client.table.return_value.upsert.call_args
+    assert isinstance(args[0], list) and len(args[0]) == 2
+    assert kwargs.get("on_conflict") == "symbol,ts,period"
+    assert p.pending_count() == 0
+
+
+def test_upsert_many_empty_is_noop(tmp_path):
+    client = _ok_client()
+    p = _p(client, tmp_path)
+    assert p.upsert_many("oi_history", []) is True
+    client.table.return_value.upsert.assert_not_called()
+
+
+def test_upsert_many_failure_enqueues_batch_and_flush(tmp_path):
+    p = _p(_failing_client(), tmp_path)
+    rows = [{"symbol": "X", "ts": "t1", "open_interest": 1.0, "period": "1h"}]
+    assert p.upsert_many("oi_history", rows) is False
+    assert p.pending_count() == 1          # 배치 전체가 outbox 1건
+    p.client = _ok_client()
+    assert p.flush_outbox() == 1
+    assert p.pending_count() == 0
+    # 재전송 시 배치(list)로 전송
+    sent = p.client.table.return_value.upsert.call_args[0][0]
+    assert isinstance(sent, list)
