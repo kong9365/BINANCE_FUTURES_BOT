@@ -234,22 +234,26 @@ def run_portfolio(
     port_cfg: Optional[PortfolioConfig] = None,
     bar_hours: float = 1.0,
     benchmark_symbol: str = "BTCUSDT",
+    signal_fn=None,
 ) -> PortfolioResult:
     """포트폴리오 백테스트 실행(공유 자본·동시보유 제한·MTM 자본곡선).
 
     data: {symbol: DataFrame[open,high,low,close,volume,(funding_rate)]} (UTC index).
     tiers: {symbol: 1|2|3} 슬리피지 티어.
+    signal_fn: df → df(+signal,atr) 콜백(None 이면 돌파 compute_signals 사용).
+        다른 전략(예: 펀딩 페이드)을 동일 실행/비용/포트폴리오 모델로 검증하기 위함.
     """
     breakout_cfg = breakout_cfg or BreakoutConfig()
     exec_cfg = exec_cfg or ExecConfig()
     port_cfg = port_cfg or PortfolioConfig()
+    sig_fn = signal_fn or (lambda d: compute_signals(d, breakout_cfg))
 
     # 신호 사전 계산 + numpy 배열화
     prepared: Dict[str, dict] = {}
     all_ts: set = set()
     for sym, df in data.items():
         df = df.sort_index()
-        sdf = compute_signals(df, breakout_cfg)
+        sdf = sig_fn(df)
         prepared[sym] = {
             "ts": sdf.index.to_numpy(),
             "open": sdf["open"].to_numpy(float),
