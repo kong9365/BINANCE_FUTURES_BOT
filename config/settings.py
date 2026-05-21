@@ -376,3 +376,20 @@ class LiveProbeConfig:
 
 
 LIVE_PROBE_CONFIG = LiveProbeConfig()
+
+
+# ─────────────────────────────────────────────────────
+# OIScanner (Layer 3 — OI 급증 후보 스캔)
+# ─────────────────────────────────────────────────────
+@dataclass
+class OIScannerConfig:
+    oi_change_threshold_pct: float = 5.0      # 후보 편입 OI 변화율 하한(%)
+    price_change_threshold_pct: float = 2.0   # 후보 편입 가격 변화율 하한(절댓값,%)
+    top_n: int = 10                            # 반환 최대 후보 수
+    # OI 변화율 측정 윈도우 — 직전 스캔(30초) 대비가 아니라 OI 이력 기반.
+    # "30초 안에 5% OI 급증"이 사실상 불가능했던 문제 교정(정량 진단 반영).
+    oi_lookback_period: str = "15m"           # OI 이력 집계 주기
+    oi_lookback_count: int = 1                 # 현재 vs N주기 전 비교
+
+
+OISCANNER_CONFIG = OIScannerConfig()

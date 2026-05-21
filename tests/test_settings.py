@@ -21,6 +21,7 @@ from config.settings import (
     RegimeConfig,
     RegimeTradingParams,
     LiveProbeConfig,
+    OIScannerConfig,
     RiskRules,
     SizingConfig,
     SystemConfig,
@@ -39,6 +40,7 @@ from config.settings import (
     SYSTEM_CONFIG,
     TRADE_EXECUTOR_CONFIG,
     LIVE_PROBE_CONFIG,
+    OISCANNER_CONFIG,
     WEEKLY_ANALYST_CONFIG,
 )
 
@@ -331,6 +333,17 @@ def test_live_probe_budget_invalid_env_falls_back(monkeypatch):
     for bad in ("", "abc", "0", "-5"):
         monkeypatch.setenv("LIVE_PROBE_BUDGET_USDT", bad)
         assert LiveProbeConfig().live_probe_budget_usdt == 300.0
+
+
+# ── OIScannerConfig (OI 룩백 윈도우) ──
+def test_oiscanner_config_defaults():
+    c = OIScannerConfig()
+    assert c.oi_change_threshold_pct == 5.0
+    assert c.price_change_threshold_pct == 2.0
+    assert c.top_n == 10
+    assert c.oi_lookback_period == "15m"
+    assert c.oi_lookback_count == 1
+    assert isinstance(OISCANNER_CONFIG, OIScannerConfig)
 
 
 # ── 패키지 export ──

@@ -55,6 +55,7 @@ from config.settings import (
     HEALTH_MONITOR_CONFIG,
     LIVE_PROBE_CONFIG,
     MACRO_EVENT_CONFIG,
+    OISCANNER_CONFIG,
     PAIR_WHITELIST_CONFIG,
     REGIME_CONFIG,
     REGIME_TRADING_PARAMS,
@@ -270,7 +271,14 @@ class MainBot:
         )
 
         # ── 데이터 / 스캔 ──
-        self.oi_scanner = OIScanner(self.collector)
+        self.oi_scanner = OIScanner(
+            self.collector,
+            oi_change_threshold_pct=OISCANNER_CONFIG.oi_change_threshold_pct,
+            price_change_threshold_pct=OISCANNER_CONFIG.price_change_threshold_pct,
+            top_n=OISCANNER_CONFIG.top_n,
+            oi_lookback_period=OISCANNER_CONFIG.oi_lookback_period,
+            oi_lookback_count=OISCANNER_CONFIG.oi_lookback_count,
+        )
 
         # ── 전략 / 사이징 ──
         self.regime_detector = RegimeDetector(

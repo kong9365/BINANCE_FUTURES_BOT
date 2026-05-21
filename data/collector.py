@@ -278,6 +278,38 @@ class BinanceDataCollector:
             self._note_fetch_error(symbol, "OI", e)
             return None
 
+    async def get_open_interest_history(
+        self, symbol: str, period: str = "15m", limit: int = 2
+    ) -> list[float]:
+        """OI 이력(sumOpenInterest)을 오래된→최신 순으로 반환한다.
+
+        Binance futures_open_interest_hist(period: 5m/15m/30m/1h/2h/4h/6h/12h/1d)
+        를 사용해 룩백 윈도우 기준 OI 변화율 산출에 쓴다(직전 스캔 30초가 아니라
+        의미 있는 시간 창으로 비교하기 위함).
+
+        Args:
+            symbol: 거래 페어.
+            period: OI 집계 주기(예: "15m").
+            limit: 가져올 데이터 포인트 수.
+
+        Returns:
+            sumOpenInterest float 리스트(오래된→최신). 실패/없음 시 빈 리스트.
+        """
+        if not symbol:
+            logger.warning("[Collector] get_open_interest_history: symbol 비어 있음")
+            return []
+        if symbol in self._delisted_symbols:
+            return []   # 상장폐지/정산 종목 — 조용히 스킵
+        try:
+            raw = await asyncio.to_thread(
+                self.client.futures_open_interest_hist,
+                symbol=symbol, period=period, limit=limit,
+            )
+            return [float(d["sumOpenInterest"]) for d in (raw or [])]
+        except Exception as e:
+            self._note_fetch_error(symbol, "OI 이력", e)
+            return []
+
     @staticmethod
     def _is_delisted_error(e: Exception) -> bool:
         """예외가 상장폐지/정산/거래중지 신호인지 판별한다.

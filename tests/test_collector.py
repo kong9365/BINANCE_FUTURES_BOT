@@ -324,3 +324,31 @@ async def test_transient_error_still_logs_error_not_skipped(collector, mock_clie
         assert await collector.get_open_interest("SOLUSDT") is None
     assert "SOLUSDT" not in collector._delisted_symbols
     assert any(r.levelno >= logging.ERROR for r in caplog.records)
+
+
+# ── 14. OI 이력 (룩백 윈도우) ───────────────────────────────────────
+
+async def test_get_open_interest_history_parses_sum_oi(collector, mock_client):
+    """futures_open_interest_hist → sumOpenInterest float 리스트(오래된→최신)."""
+    mock_client.futures_open_interest_hist.return_value = [
+        {"symbol": "SOLUSDT", "sumOpenInterest": "1000.0", "timestamp": 1},
+        {"symbol": "SOLUSDT", "sumOpenInterest": "1150.5", "timestamp": 2},
+    ]
+    out = await collector.get_open_interest_history("SOLUSDT", period="15m", limit=2)
+    assert out == [1000.0, 1150.5]
+    mock_client.futures_open_interest_hist.assert_called_once_with(
+        symbol="SOLUSDT", period="15m", limit=2
+    )
+
+
+async def test_get_open_interest_history_failure_returns_empty(collector, mock_client):
+    """조회 실패 → 빈 리스트."""
+    mock_client.futures_open_interest_hist.side_effect = Exception("net")
+    assert await collector.get_open_interest_history("SOLUSDT") == []
+
+
+async def test_get_open_interest_history_skips_delisted(collector, mock_client):
+    """상장폐지 등록 심볼은 이력 조회도 스킵(빈 리스트, API 미호출)."""
+    collector._delisted_symbols.add("MATICUSDT")
+    assert await collector.get_open_interest_history("MATICUSDT") == []
+    mock_client.futures_open_interest_hist.assert_not_called()
