@@ -93,9 +93,64 @@ def make_candles(direction, n=120, base_price=50000.0, atr_pct=0.5):
     )
 
 
+def make_candles_with_oi(direction="up", n=40, base_price=50000.0, atr_pct=1.0,
+                         oi_base=1_000_000.0, oi_step_pct=4.0):
+    """OHLCV + open_interest 컬럼 DataFrame. OI 는 매 봉 oi_step_pct% 복리 변화."""
+    df = make_candles(direction, n=n, base_price=base_price, atr_pct=atr_pct).copy()
+    oi = []
+    val = oi_base
+    for _ in range(n):
+        oi.append(val)
+        val *= (1.0 + oi_step_pct / 100.0)
+    df["open_interest"] = oi
+    return df
+
+
 def _default_config():
     """BTCUSDT 단일 페어 기본 BacktestConfig."""
     return BacktestConfig(pairs=["BTCUSDT"])
+
+
+def _oi_surge_config():
+    """oi_surge 전략 — 테스트용 완화 임계(OI 3% / 가격 0.5%)."""
+    return BacktestConfig(
+        pairs=["BTCUSDT"], strategy="oi_surge",
+        oi_change_threshold_pct=3.0, price_change_threshold_pct=0.5,
+        oi_lookback_bars=1,
+    )
+
+
+# ── OI-급증 전략 (라이브 OIScanner 재현) ────────────────────────────
+
+def test_oi_surge_strategy_generates_trades():
+    """OI +4%/봉 + 가격 상승 → oi_surge_long 거래 발생."""
+    candles = make_candles_with_oi("up", n=40, atr_pct=1.0, oi_step_pct=4.0)
+    result = BacktestEngine(_oi_surge_config()).run({"BTCUSDT": candles})
+    assert result.total_trades > 0
+    assert "oi_surge_long" in result.setup_stats
+    assert set(result.setup_stats) <= {"oi_surge_long", "oi_surge_short"}
+
+
+def test_oi_surge_flat_oi_no_trades():
+    """OI 변화 0(임계 미달) → 거래 0건."""
+    candles = make_candles_with_oi("up", n=40, atr_pct=1.0, oi_step_pct=0.0)
+    result = BacktestEngine(_oi_surge_config()).run({"BTCUSDT": candles})
+    assert result.total_trades == 0
+
+
+def test_oi_surge_missing_oi_column_no_trades():
+    """open_interest 컬럼이 없으면 oi_surge 는 무거래(크래시 없음)."""
+    candles = make_candles("up", n=40, atr_pct=1.0)   # OI 컬럼 없음
+    result = BacktestEngine(_oi_surge_config()).run({"BTCUSDT": candles})
+    assert result.total_trades == 0
+
+
+def test_oi_surge_short_on_downtrend():
+    """OI 급증 + 가격 하락 → oi_surge_short 방향."""
+    candles = make_candles_with_oi("down", n=40, atr_pct=1.0, oi_step_pct=4.0)
+    result = BacktestEngine(_oi_surge_config()).run({"BTCUSDT": candles})
+    assert result.total_trades > 0
+    assert "oi_surge_short" in result.setup_stats
 
 
 # ── 시나리오 1: 상승추세 → TREND_UP, 양의 수익 ──

@@ -94,6 +94,13 @@ class BacktestConfig:
     initial_capital: float = 1000.0
     pairs: List[str] = field(default_factory=lambda: ["BTCUSDT", "ETHUSDT"])
 
+    # 전략 선택: "trend_follow"(레짐 추세추종, 기존) / "oi_surge"(라이브 OIScanner 재현)
+    strategy: str = "trend_follow"
+    # oi_surge 전용 — 라이브 OIScanner 와 동일 의미. open_interest 컬럼 필요.
+    oi_change_threshold_pct: float = 5.0       # OI 변화율 하한(%)
+    price_change_threshold_pct: float = 2.0    # 가격 변화율 하한(절댓값, %)
+    oi_lookback_bars: int = 1                  # 현재 vs N봉 전 OI/가격 비교
+
     # 비용 가정 (보수적, §10-2)
     maker_fee: float = 0.00018
     taker_fee: float = 0.00045
@@ -411,10 +418,14 @@ class BacktestEngine:
     ) -> Optional[Signal]:
         """진입 신호 평가. 거래 불가 시 None.
 
-        전략: TREND_UP → LONG, TREND_DOWN → SHORT. 그 외 레짐은 무거래.
+        strategy="oi_surge" 면 라이브 OIScanner 와 동일한 OI 급증 신호를 재현하고,
+        그 외(기본 "trend_follow")는 레짐 추세추종을 쓴다.
         ATR 은 ts 이전 마감봉으로만 계산하고, 진입가는 봉 ts 의 open 만 사용한다
         (룩어헤드 차단 단계 2·3).
         """
+        if self.config.strategy == "oi_surge":
+            return self._evaluate_oi_surge(symbol, ts, regime_state, equity)
+
         if regime_state.regime == Regime.TREND_UP:
             action = "LONG"
         elif regime_state.regime == Regime.TREND_DOWN:
@@ -467,6 +478,88 @@ class BacktestEngine:
             symbol=symbol,
             action=action,
             setup_tag=f"trend_follow_{action.lower()}",
+            regime=regime_state.regime,
+            confidence=regime_state.confidence,
+            entry_ts=ts,
+            entry_price=entry_price,
+            tp_price=tp_price,
+            sl_price=sl_price,
+            atr=atr,
+            pair_tier=pair_tier,
+            size_usdt=sizing.size_usdt,
+        )
+
+    def _evaluate_oi_surge(
+        self, symbol: str, ts: Any, regime_state, equity: float
+    ) -> Optional[Signal]:
+        """라이브 OIScanner 재현 — OI 급증 + 가격 변동 동시 충족 시 진입(룩어헤드 차단).
+
+        OI/가격 변화율은 ts 이전 마감봉(open_interest/close)만으로 lookback_bars 창
+        기준 계산한다. 방향은 가격 모멘텀 부호(상승→LONG, 하락→SHORT). 진입가는 봉
+        ts 의 open. TP/SL 은 마감봉 ATR 기반.
+        """
+        df = self._candles_by_pair[symbol]
+        if "open_interest" not in df.columns:
+            return None
+
+        closed = df[df.index < ts]
+        lb = self.config.oi_lookback_bars
+        if len(closed) < lb + 1 or len(closed) < ATR_PERIOD + 1:
+            return None
+
+        oi_now = float(closed["open_interest"].iloc[-1])
+        oi_base = float(closed["open_interest"].iloc[-1 - lb])
+        if oi_base <= 0:
+            return None
+        oi_change_pct = (oi_now - oi_base) / oi_base * 100.0
+
+        close_now = float(closed["close"].iloc[-1])
+        close_base = float(closed["close"].iloc[-1 - lb])
+        if close_base <= 0:
+            return None
+        price_change_pct = (close_now - close_base) / close_base * 100.0
+
+        if (oi_change_pct < self.config.oi_change_threshold_pct
+                or abs(price_change_pct) < self.config.price_change_threshold_pct):
+            return None
+
+        action = "LONG" if price_change_pct > 0 else "SHORT"
+
+        atr = self._calc_atr(self._get_candles_until(symbol, "1h", ts), ATR_PERIOD)
+        if atr <= 0:
+            return None
+        if ts not in df.index:
+            return None
+        entry_price = float(df.at[ts, "open"])
+        if entry_price <= 0:
+            return None
+
+        if action == "LONG":
+            tp_price = entry_price + TP_ATR_MULT * atr
+            sl_price = entry_price - SL_ATR_MULT * atr
+        else:  # SHORT
+            tp_price = entry_price - TP_ATR_MULT * atr
+            sl_price = entry_price + SL_ATR_MULT * atr
+        if sl_price <= 0 or tp_price <= 0:
+            return None
+
+        pair_tier = PAIR_TIERS.get(symbol, 2)
+        sizing = self.sizer.calculate(
+            capital=equity,
+            win_rate=_DEFAULT_BACKTEST_WIN_RATE,
+            avg_win_R=_DEFAULT_BACKTEST_WIN_R,
+            avg_loss_R=_DEFAULT_BACKTEST_LOSS_R,
+            regime=regime_state.regime,
+            confidence=regime_state.confidence,
+            sample_count=0,
+        )
+        if sizing.size_usdt <= 0:
+            return None
+
+        return Signal(
+            symbol=symbol,
+            action=action,
+            setup_tag=f"oi_surge_{action.lower()}",
             regime=regime_state.regime,
             confidence=regime_state.confidence,
             entry_ts=ts,
