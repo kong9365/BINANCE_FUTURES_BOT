@@ -86,6 +86,11 @@ class BinanceDataCollector:
         self._ws_user_callback: Callable | None = None
         self._ws_started = False
 
+        # 상장폐지/정산 종목 스킵 집합 — 첫 -4108(또는 price 누락) 감지 시 등록하여
+        # 이후 스캔에서 OI/시세 조회를 건너뛴다(매 스캔 ERROR 로그 노이즈 + 불필요한
+        # API 호출 방지).
+        self._delisted_symbols: set[str] = set()
+
         if binance_client is not None:
             self.client = binance_client
             logger.info("[Collector] 외부 주입 클라이언트 사용 (testnet=%s)", use_testnet)
@@ -239,13 +244,15 @@ class BinanceDataCollector:
         if not symbol:
             logger.warning("[Collector] get_ticker_price: symbol 비어 있음 — None 반환")
             return None
+        if symbol in self._delisted_symbols:
+            return None   # 상장폐지/정산 종목 — 조용히 스킵
         try:
             data = await asyncio.to_thread(
                 self.client.futures_symbol_ticker, symbol=symbol
             )
             return float(data["price"])
         except Exception as e:
-            logger.error("[Collector] %s 시세 조회 실패: %s", symbol, e)
+            self._note_fetch_error(symbol, "시세", e)
             return None
 
     async def get_open_interest(self, symbol: str) -> float | None:
@@ -260,14 +267,48 @@ class BinanceDataCollector:
         if not symbol:
             logger.warning("[Collector] get_open_interest: symbol 비어 있음 — None 반환")
             return None
+        if symbol in self._delisted_symbols:
+            return None   # 상장폐지/정산 종목 — 조용히 스킵
         try:
             data = await asyncio.to_thread(
                 self.client.futures_open_interest, symbol=symbol
             )
             return float(data["openInterest"])
         except Exception as e:
-            logger.error("[Collector] %s OI 조회 실패: %s", symbol, e)
+            self._note_fetch_error(symbol, "OI", e)
             return None
+
+    @staticmethod
+    def _is_delisted_error(e: Exception) -> bool:
+        """예외가 상장폐지/정산/거래중지 신호인지 판별한다.
+
+        Binance -4108(Symbol is on delivering/delivered/settling/closed/pre-trading)
+        또는 시세 응답에 'price' 키가 없는 경우(삭제된 심볼)를 포괄한다.
+        """
+        s = str(e).lower()
+        return (
+            "-4108" in s
+            or "delivering" in s
+            or "delivered" in s
+            or "settling" in s
+            or "closed or pre-trading" in s
+            or s == "'price'"           # KeyError('price') — 삭제 심볼 ticker 응답
+            or s == "'openinterest'"    # KeyError('openInterest')
+        )
+
+    def _note_fetch_error(self, symbol: str, kind: str, e: Exception) -> None:
+        """조회 실패를 로깅한다. 상장폐지/정산이면 1회 WARNING 후 스킵 등록(노이즈 차단),
+        그 외(일시적 네트워크 등)는 ERROR 로 남긴다.
+        """
+        if self._is_delisted_error(e):
+            if symbol not in self._delisted_symbols:
+                self._delisted_symbols.add(symbol)
+                logger.warning(
+                    "[Collector] %s 상장폐지/정산 종목으로 판단 — 이후 스캔에서 제외: %s",
+                    symbol, e,
+                )
+            return  # 이미 등록됐으면 조용히
+        logger.error("[Collector] %s %s 조회 실패: %s", symbol, kind, e)
 
     async def get_24h_quote_volume(self, symbol: str) -> float | None:
         """24시간 거래대금(quote volume, USDT)을 조회한다.

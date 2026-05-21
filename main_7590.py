@@ -1046,16 +1046,29 @@ class MainBot:
             return "확인 실패"
         if cur == self._protected_baseline:
             return "불변 ✅ (봇 비접근)"
-        # 변경 감지 → CRITICAL (기존 보유분이 바뀜 — 봇 외 요인 또는 사고)
-        logger.critical(
-            "[Heartbeat] 기존 보호종목 보유분 변경 감지! baseline=%s cur=%s",
-            self._protected_baseline, cur,
+        # 변경 감지 — 봇은 보호종목을 거래/청산/취소할 수 없으므로(executor guard +
+        # PairWhitelist 차단), 이 변화는 봇이 아니라 **운영자 자신의 stop-loss/청산
+        # 또는 시장 트리거**다(정상). 따라서 CRITICAL 이 아니라 정보성 알림으로 처리하고,
+        # baseline 을 새 상태로 갱신해 동일 변경을 매 heartbeat 반복 알림하지 않는다.
+        removed = {
+            k: sorted(set(self._protected_baseline[k]) - set(cur[k])) for k in cur
+        }
+        added = {
+            k: sorted(set(cur[k]) - set(self._protected_baseline[k])) for k in cur
+        }
+        logger.warning(
+            "[Heartbeat] 보호종목 보유분 변경(봇 무관 — 운영자 자산/시장): "
+            "removed=%s added=%s", removed, added,
         )
         await self.telegram.send(
-            "🚨 CRITICAL: 기존 보호종목 보유분 변경 감지 — 거래소 확인 필요\n"
-            f"baseline={self._protected_baseline}\ncurrent={cur}"
+            "ℹ️ 보호종목 보유분 변경 감지 (봇 무관 — 운영자 자신의 stop/청산 또는 "
+            "시장 트리거로 추정)\n"
+            f"감소: { {k: v for k, v in removed.items() if v} }\n"
+            f"증가: { {k: v for k, v in added.items() if v} }\n"
+            "→ 봇은 보호종목을 거래/청산하지 않습니다(가드). baseline 갱신."
         )
-        return "변경 감지 🚨"
+        self._protected_baseline = cur  # 새 상태로 갱신 → 반복 알림 방지
+        return "변경 감지(봇 무관, baseline 갱신)"
 
     @staticmethod
     def _format_timedelta(td: timedelta) -> str:

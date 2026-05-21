@@ -557,8 +557,12 @@ async def test_preflight_alert_pass_content(bot):
     assert bot._protected_baseline is not None
 
 
-async def test_heartbeat_detects_protected_change_critical(bot):
-    """heartbeat 가 기존 보호종목 보유분 변경을 감지하면 CRITICAL 알림."""
+async def test_heartbeat_protected_change_informational_not_critical(bot):
+    """보호종목 정상 변동(운영자 자신의 stop-loss 등)은 정보성 알림 — CRITICAL 아님.
+
+    봇은 보호종목을 거래/청산할 수 없으므로(guards) 보호종목 변동은 봇 무관.
+    또한 baseline 을 갱신해 동일 변경을 반복 알림하지 않는다(오탐/스팸 완화).
+    """
     bot.dry_run = False
     bot.capital_manager.get_snapshot = AsyncMock(return_value=_snapshot())
     bot._started_at = datetime.now(timezone.utc)
@@ -566,16 +570,31 @@ async def test_heartbeat_detects_protected_change_critical(bot):
         "positions": ["INJUSDT", "LYNUSDT"], "orders": ["ETHUSDT"],
         "algos": ["INJUSDT"],
     }
-    # INJUSDT 포지션이 사라짐 → 변경 감지
+    # INJUSDT 포지션·algo 가 사라짐 (운영자 자신의 stop-loss 체결 — 정상)
     bot.executor.preflight_open_position_symbols = AsyncMock(return_value=["LYNUSDT"])
     bot.executor.preflight_open_order_symbols = AsyncMock(return_value=["ETHUSDT"])
-    bot.executor.preflight_open_algo_symbols = AsyncMock(return_value=["INJUSDT"])
+    bot.executor.preflight_open_algo_symbols = AsyncMock(return_value=[])
     bot.telegram.send.reset_mock()
 
     await bot._maybe_send_heartbeat()
 
     sent = [c.args[0] for c in bot.telegram.send.call_args_list]
-    assert any("🚨 CRITICAL" in m and "보호종목 보유분 변경 감지" in m for m in sent)
+    change_msgs = [m for m in sent if "보호종목 보유분 변경 감지" in m]
+    assert len(change_msgs) == 1
+    # 정보성(ℹ️)이며 CRITICAL(🚨) 이 아니어야 함
+    assert "ℹ️" in change_msgs[0]
+    assert not any("🚨 CRITICAL" in m for m in sent)
+    # baseline 이 새 상태로 갱신됨 (반복 알림 방지)
+    assert bot._protected_baseline == {
+        "positions": ["LYNUSDT"], "orders": ["ETHUSDT"], "algos": [],
+    }
+
+    # 두 번째 heartbeat (interval 경과) → 동일 상태이므로 변경 알림 재발송 없음
+    bot._last_heartbeat = None
+    bot.telegram.send.reset_mock()
+    await bot._maybe_send_heartbeat()
+    sent2 = [c.args[0] for c in bot.telegram.send.call_args_list]
+    assert not any("보호종목 보유분 변경 감지" in m for m in sent2)
 
 
 # ── 6c. reconcile_closed_positions 호출 (v3.1.2) ────────────────────

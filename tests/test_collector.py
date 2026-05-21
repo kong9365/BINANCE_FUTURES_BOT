@@ -283,3 +283,44 @@ def test_start_stop_ws_stub_idempotent(collector):
     assert collector._ws_started is False
     collector.stop_ws()  # 재호출 안전
     assert collector._ws_started is False
+
+
+# ── 13. 상장폐지/정산 종목 노이즈 정리 ──────────────────────────────
+
+async def test_delisted_symbol_oi_demoted_and_skipped(collector, mock_client, caplog):
+    """OI -4108(상장폐지/정산) → WARNING 1회 + 스킵 등록 → 이후 조회 미수행."""
+    import logging
+    mock_client.futures_open_interest.side_effect = Exception(
+        "APIError(code=-4108): Symbol is on delivering or delivered or settling "
+        "or closed or pre-trading."
+    )
+    with caplog.at_level(logging.WARNING, logger="data.collector"):
+        assert await collector.get_open_interest("MATICUSDT") is None
+    # 상장폐지 스킵 집합에 등록 + ERROR 아님(WARNING)
+    assert "MATICUSDT" in collector._delisted_symbols
+    assert not any(r.levelno >= logging.ERROR for r in caplog.records)
+
+    # 2회차: 스킵되어 API 미호출
+    mock_client.futures_open_interest.reset_mock()
+    assert await collector.get_open_interest("MATICUSDT") is None
+    mock_client.futures_open_interest.assert_not_called()
+
+
+async def test_delisted_symbol_ticker_skipped(collector, mock_client):
+    """ticker 'price' 누락(삭제 심볼) → 스킵 등록 → 이후 시세 조회 미수행."""
+    mock_client.futures_symbol_ticker.return_value = {}   # 'price' 없음 → KeyError
+    assert await collector.get_ticker_price("MATICUSDT") is None
+    assert "MATICUSDT" in collector._delisted_symbols
+    mock_client.futures_symbol_ticker.reset_mock()
+    assert await collector.get_ticker_price("MATICUSDT") is None
+    mock_client.futures_symbol_ticker.assert_not_called()
+
+
+async def test_transient_error_still_logs_error_not_skipped(collector, mock_client, caplog):
+    """일시적(네트워크) 오류는 ERROR 로 남고 스킵 등록되지 않는다(상장폐지 아님)."""
+    import logging
+    mock_client.futures_open_interest.side_effect = Exception("Connection timeout")
+    with caplog.at_level(logging.ERROR, logger="data.collector"):
+        assert await collector.get_open_interest("SOLUSDT") is None
+    assert "SOLUSDT" not in collector._delisted_symbols
+    assert any(r.levelno >= logging.ERROR for r in caplog.records)
