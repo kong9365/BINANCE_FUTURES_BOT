@@ -17,6 +17,7 @@ v3.1.2 봇의 실거래 투입 전 안정화 작업을 다회 세션에 걸쳐 �
 ## 1. 저장소 / 환경 (중요 — 작업 메커니즘)
 - **작업본**: `C:\Users\jaeho\OneDrive\Desktop\Cursor\BINANCE_FUTURES_BOT` — **git 저장소가 아님**(여기서 코드 수정·실행).
 - **git 저장소(클론)**: `C:\Users\jaeho\OneDrive\Desktop\Cursor\BINANCE_FUTURES_BOT_GITHUB` — origin = `kong9365/BINANCE_FUTURES_BOT`.
+- **수집 전용 클론**: `C:\bots\BINANCE_FUTURES_BOT` (2026-05-21 추가, OneDrive 밖 fresh clone + `.env` 복사 + 캐시 이관). 무인 OI 수집 스케줄 작업(`BinanceOICollect`)이 여기서 실행됨. 코드 수정은 여전히 OneDrive 작업본에서.
 - **GitHub 반영 = "A안"**: 작업본에서 변경 파일을 클론으로 **명시 복사** → 클론에서 보안체크 → `pytest` → `git add <파일명 명시>`(`git add .`/`-A` 금지) → 커밋 → push.
   - 커밋은 git 신원 미설정이라 `git -c user.name="kong9365" -c user.email="jaehong9365@gmail.com" commit ...` 1회 오버라이드 사용.
   - 커밋 메시지 끝에 `Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>`.
@@ -67,11 +68,11 @@ v3.1.2 봇의 실거래 투입 전 안정화 작업을 다회 세션에 걸쳐 �
 - 비보호종목 기존 항목 0. preflight 통과 가능 상태.
 
 ## 7. 미해결 / 남은 작업 (우선순위)
-1. **저장소를 OneDrive 밖으로 이전** (예: `C:\bots\BINANCE_FUTURES_BOT`). 이유: OneDrive 경로라 Windows 작업 스케줄러가 OI 수집을 무인 실행 못 함(`BinanceOICollect` 작업은 등록됐으나 Result 0인데 실제 수집 안 됨; 직접 실행은 정상). **무인 OI 누적의 전제.** .env/clone/스케줄 경로 재정리 동반.
+1. ✅ **(완료, 2026-05-21) 무인 OI 수집 정상화.** 진단 정정: 무인 실행 실패의 **진짜 원인은 OneDrive가 아니라** Windows 작업 기본 설정 `DisallowStartIfOnBatteries=True`(노트북 배터리 전원이면 미실행, schtasks는 Result 0 보고)였음. 조치: 수집 전용 클론을 `C:\bots\BINANCE_FUTURES_BOT`로 이전 + 작업을 `-AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable`로 재등록 → 스케줄 트리거 시 실제 수집(로그 새 줄·캐시 갱신) 검증 완료. 상세는 `docs/OI_COLLECTION.md`.
 2. **OI 데이터 수개월 누적** (`python -m backtesting.collect_oi` 시간별) → 충분(거래 ≥200건 분량) 시 **oi_surge walk-forward 검증**.
 3. **임계/윈도우 재보정** — 검증 데이터 확보 후. 현재 후보: 1h 창 + OI 1~2% + 가격 0.5~1%(단 노이즈, 데이터 더 필요).
 4. **백테스트 방향 로직 정합** — `_evaluate_oi_surge`는 가격 모멘텀 부호로 방향 결정(라이브의 QualityGate/regime 필터 미반영) → 데이터 축적 후 정합.
-5. **등록된 스케줄 작업 처리** — `BinanceOICollect`(시간별, 배치 래퍼 `run_collect_oi.bat` 사용, 미커밋·머신특정). OneDrive 이전 후 경로 갱신 또는 `schtasks /Delete /TN BinanceOICollect /F`로 정리.
+5. ✅ **(완료) 스케줄 작업 정리** — `BinanceOICollect`를 `C:\bots\BINANCE_FUTURES_BOT\run_collect_oi.bat` 경로 + 배터리 허용 설정으로 재등록(구 OneDrive 작업 삭제). `run_collect_oi.bat`는 머신특정·미커밋 유지.
 6. **Testnet 전체 생애주기 실관측** (자연 STOP/TP 트리거→reconcile→DB CLOSED) — 라이브 GO 전 권장.
 7. **전략 근본 판단**: OI-급증이 데이터/인프라상 검증 가능한지, 아니면 검증 가능한 다른 신호로 전환할지 결정(데이터 누적 결과 보고 판단).
 

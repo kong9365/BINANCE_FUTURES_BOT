@@ -17,10 +17,14 @@ python -m backtesting.collect_oi [--interval 1h] [--oi-period 1h] [--limit 500]
 ## 스케줄 등록 (OS 레벨 — 무인 장기 누적 권장)
 
 ### Windows (현재 환경) — PowerShell 1회 등록
+> 수집 전용 실행 위치는 `C:\bots\BINANCE_FUTURES_BOT`(OneDrive 밖, GitHub fresh clone +
+> `.env` 복사). 래퍼는 `run_collect_oi.bat`(start/exit 로그 남김). **배터리 설정 필수**
+> — 아래 `-AllowStartIfOnBatteries -DontStopIfGoingOnBatteries`(노트북 기본값이면 미실행, ⚠️ 아래 참조).
 ```powershell
-$action  = New-ScheduledTaskAction -Execute "cmd.exe" -Argument '/c ""C:\Python314\python.exe" -m backtesting.collect_oi >> logs\oi_collect.log 2>&1"' -WorkingDirectory "C:\Users\jaeho\OneDrive\Desktop\Cursor\BINANCE_FUTURES_BOT"
-$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Hours 1) -RepetitionDuration ([TimeSpan]::MaxValue)
-Register-ScheduledTask -TaskName "BinanceOICollect" -Action $action -Trigger $trigger -Description "Hourly OI/OHLCV accumulation for OI-surge backtest validation" -Force
+$action   = New-ScheduledTaskAction -Execute "C:\bots\BINANCE_FUTURES_BOT\run_collect_oi.bat" -WorkingDirectory "C:\bots\BINANCE_FUTURES_BOT"
+$trigger  = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Hours 1) -RepetitionDuration (New-TimeSpan -Days 3650)
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 1)
+Register-ScheduledTask -TaskName "BinanceOICollect" -Action $action -Trigger $trigger -Settings $settings -Description "Hourly OI/OHLCV accumulation (C:\bots) for OI-surge backtest validation" -Force
 ```
 확인 / 즉시 실행 / 제거:
 ```powershell
@@ -45,22 +49,27 @@ cfg  = BacktestConfig(pairs=list(data), strategy="oi_surge",
 result = BacktestEngine(cfg).run(data)   # total_trades / win_rate / expectancy_R / profit_factor
 ```
 
-## ⚠️ 환경 주의 — OneDrive 경로에서는 스케줄 실행 실패
-현재 저장소가 OneDrive 폴더(`C:\Users\<user>\OneDrive\...`) 아래에 있으면, Windows
-**작업 스케줄러 비대화 컨텍스트가 OneDrive 가상화 경로로 cd/실행을 못 해** 작업이
-"성공(0)"으로 보고되면서도 **실제로는 수집하지 않는다**(검증됨: 수동/직접 실행은
-정상, 스케줄 실행은 로그 미생성·캐시 미갱신).
+## ⚠️ 진짜 원인은 OneDrive가 아니라 "배터리 전원 시 시작 안 함" 설정 (2026-05-21 정정)
+초기엔 OneDrive 가상화 경로가 스케줄 실행을 막는다고 추정했으나, **검증 결과 오진**이었다.
+Windows 작업의 기본 설정 `DisallowStartIfOnBatteries=True` + `StopIfGoingOnBatteries=True`
+때문에, **노트북이 배터리 전원이면 작업이 시작조차 안 되면서도 `schtasks /Run`은
+"성공(0)"으로 보고**한다(로그 미생성·캐시 미갱신). 이게 OneDrive에서도, C:\bots에서도
+동일하게 나타난 진짜 원인이다(직접/수동 실행은 어디서든 정상이라 OneDrive를 의심했던 것).
 
-**해결(권장 순서):**
-1. **저장소를 OneDrive 밖으로 이동** (예: `C:\bots\BINANCE_FUTURES_BOT`). 그 후 위
-   등록 명령의 경로만 바꿔 재등록하면 스케줄 실행이 정상 작동한다. (가장 확실)
-2. 또는 작업을 "사용자 로그온 시에만 실행"으로 두고 OneDrive 가 해당 세션에
-   마운트·오프라인 사용 가능 상태인지 보장.
-3. 검증: 스케줄 트리거 후 `logs/oi_collect.log` 에 새 줄이 추가되고
-   `backtests/cache/*.csv` mtime 이 갱신되는지 확인.
+**해결(검증됨):**
+1. 작업 설정에 `-AllowStartIfOnBatteries -DontStopIfGoingOnBatteries` 적용(위 등록
+   명령에 포함). 누락 실행 대비 `-StartWhenAvailable`도 권장.
+   - 기존 작업만 고치려면:
+     ```powershell
+     $s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 1)
+     Set-ScheduledTask -TaskName "BinanceOICollect" -Settings $s
+     ```
+2. **검증**: `schtasks /Run /TN BinanceOICollect` 후 `logs/oi_collect.log`에 새 `exit 0`
+   줄이 추가되고 `backtests/cache/*.csv` mtime이 갱신되는지 확인.
 
-> 직접 실행(`python -m backtesting.collect_oi`)은 OneDrive 경로에서도 정상이므로,
-> 단기 누적은 수동/직접 실행으로도 가능하다. 무인 장기 누적은 위 해결책 필요.
+> C:\bots(OneDrive 밖) 이전은 했으나 — **배터리 설정이 진짜 원인이므로 위치 자체는 무관**.
+> 직접 실행(`python -m backtesting.collect_oi`)은 어느 경로에서도 정상이라, 단기 누적은
+> 수동 실행으로도 가능하다.
 
 ## 주의
 - 수집기는 데이터만 모은다. **실거래 GO와 무관(HOLD 유지).**
