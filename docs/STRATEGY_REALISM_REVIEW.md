@@ -171,11 +171,21 @@
   트레일, opt-in). **검증 결과 21일 표본에선 트레일이 더 나쁨**(승률 41%→23%, expR +0.04→−0.26):
   지속 추세 없는 단기 구간에서 휩쏘. **기본 고정 TP4/SL2 유지**, 트레일 채택은 P4 walk-forward에서
   결정. 기준선 `backtest_runs`(`breakout_trail_vs_fixed_20260521`) 기록. 단위테스트 +2, 전체 367 passed.
-- 🔄 **P5b 대기** — BTC risk-off 게이트는 BTC 데이터 축적/백테스트 후(expectancy↑·MDD↓ 입증 시).
-- ▶️ **남은 우선순위**: ③ **P5b BTC risk-off 게이트**(BTC 데이터로 백테스트) → ④ P3 펀딩 페이드
-  → ⑤ P4 walk-forward(시간 대기). #1·#2 및 모든 데이터 누적은 완료.
+- ✅ **과거 backfill 완료** — `backtesting/backfill_history.py`(페이지네이션 klines/funding +
+  taker_buy_base). Supabase에 **2년치 245,280 ohlcv(14종목·730일·taker 100%) + 30,660 funding**
+  적재. 단위테스트 +6, 전체 373 passed. **walk-forward 데이터 제약 해소(수개월 대기 불필요).**
+- 🟥 **★ 결정적 walk-forward 발견(2년·3,400+거래)**: **1h 돌파는 NET NEGATIVE**(PF 0.95,
+  expectancy_R −0.036, 누적 −305%) — P1의 "20일 +0.11"은 **노이즈였음(소표본 과적합)**.
+  **타임프레임을 올리면 엣지 출현**: 4h PF 1.04(OOS 1.00, 손익분기), **1d(일봉) PF 1.39
+  (OOS 1.63), 승률 54~57%, expectancy_R +0.23(OOS +0.42)** — OOS-견고한 진짜 추세추종 엣지.
+  **단 1d 표본 부족**(2년 89건/OOS 30건 < 200). 기준선 `backtest_runs`
+  (`breakout_walkforward_2y_timeframes_20260521`). **→ walk-forward가 1h 손실전략의 실거래를 차단.**
+- ▶️ **수정된 우선순위(데이터 발견 반영)**: ① **돌파를 1d 타임프레임으로 전환**(`breakout_interval`)
+  + 표본 확대(3~4년 backfill·종목 추가→일봉 거래≥200) + 파라미터 견고성 검증 → ② P5b BTC 게이트
+  (1d에 적용) → ③ P3 펀딩 페이드 → ④ 통과 시에만 실거래 GO 재검토(소액·운영자 승인).
 
-> 실거래 실행/주문은 전 단계에서 **금지(HOLD)**. 코드 변경은 본 계획 범위 내에서 단계별·검증 후 진행.
+> 실거래 실행/주문은 전 단계에서 **금지(HOLD)**. **현재 어떤 구성도 ≥200거래 OOS 검증을 통과하지
+> 못함**(1d는 고무적이나 표본 부족) → 실거래는 아직 불가. 코드 변경은 단계별·검증 후 진행.
 
 ---
 
