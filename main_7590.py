@@ -60,6 +60,7 @@ from config.settings import (
     REGIME_CONFIG,
     REGIME_TRADING_PARAMS,
     RISK_RULES,
+    BTC_RISK_OFF_CONFIG,
     SIZING_CONFIG,
     STRATEGY_CONFIG,
     SYSTEM_CONFIG,
@@ -77,6 +78,9 @@ from db.init_db import init_db
 from ops.system_health_monitor import SystemHealthMonitor
 from sizing.dynamic_sizer import DynamicPositionSizer
 from strategy.breakout import BreakoutConfig, evaluate_breakout
+from strategy.btc_risk_off import (
+    BTCRiskOffState, evaluate as btc_risk_off_evaluate, is_halted as btc_is_halted,
+)
 from strategy.cost_guard import CostGuard
 from strategy.oi_filter import GRADE_C_DANGER, OIFilter
 from strategy.pair_whitelist import PairWhitelist
@@ -282,6 +286,9 @@ class MainBot:
             oi_lookback_period=OISCANNER_CONFIG.oi_lookback_period,
             oi_lookback_count=OISCANNER_CONFIG.oi_lookback_count,
         )
+
+        # ── BTC Risk-Off 안전 필터 상태(LCR 셋업 C 독립 채택, Phase 0 검증) ──
+        self.btc_risk_off_state = BTCRiskOffState()
 
         # ── 활성 전략 선택 (P2): "oi_surge"(기본) | "breakout" ──
         self.active_strategy = active_strategy or STRATEGY_CONFIG.active_strategy
@@ -697,11 +704,37 @@ class MainBot:
         # ── 기존 포지션은 ExitPlanController 가 자동 관리 (HIGH_VOL 여부 무관) ──
         await self._manage_open_positions()
 
-        # ── HIGH_VOL 또는 거시 이벤트 → 신규 진입 차단 ──
-        if regime_state.regime == Regime.HIGH_VOL or macro_blocked:
+        # ── BTC Risk-Off 안전 필터 (LCR 셋업 C 독립 채택) ──
+        # BTC 1h 종가 변화 ≤ -1.2% 면 자동 6h 신규 진입 차단(쿨다운). Phase 0 데이터
+        # (BTC 동반 급락 시 알트 +4h 평균 -0.65% vs 단독 +0.39%, 1.03%pt 스프레드)로 검증.
+        now_utc = datetime.now(timezone.utc)
+        if BTC_RISK_OFF_CONFIG.enabled and candles_1h and len(candles_1h) >= 2:
+            new_state, fired = btc_risk_off_evaluate(
+                btc_close_now=float(candles_1h[-1][3]),
+                btc_close_prev=float(candles_1h[-2][3]),
+                now=now_utc, state=self.btc_risk_off_state,
+                cfg=BTC_RISK_OFF_CONFIG,
+            )
+            self.btc_risk_off_state = new_state
+            if fired is not None:
+                logger.critical(
+                    "[BTC-RiskOff] CRITICAL: BTC 1h %.2f%% 급락 → 신규 진입 %s 까지 차단",
+                    fired.drop_pct * 100, fired.halted_until.isoformat(),
+                )
+                await self.telegram.send(
+                    "🚨 BTC Risk-Off 자동 HALT\n"
+                    f"BTC 1h 변화: {fired.drop_pct*100:.2f}%\n"
+                    f"신규 진입 차단까지: {fired.halted_until.isoformat()}\n"
+                    f"(쿨다운 {BTC_RISK_OFF_CONFIG.cooldown_hours}h, "
+                    f"임계 -{BTC_RISK_OFF_CONFIG.drop_threshold_pct*100:.1f}%)"
+                )
+
+        # ── HIGH_VOL 또는 거시 이벤트 또는 BTC Risk-Off → 신규 진입 차단 ──
+        btc_off = btc_is_halted(self.btc_risk_off_state, now_utc)
+        if regime_state.regime == Regime.HIGH_VOL or macro_blocked or btc_off:
             logger.info(
-                "[Main] 신규 진입 차단: regime=%s, macro=%s",
-                regime_state.regime, macro_blocked,
+                "[Main] 신규 진입 차단: regime=%s, macro=%s, btc_risk_off=%s",
+                regime_state.regime, macro_blocked, btc_off,
             )
             return
 

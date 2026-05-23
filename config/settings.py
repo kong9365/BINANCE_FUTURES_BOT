@@ -396,6 +396,24 @@ OISCANNER_CONFIG = OIScannerConfig()
 
 
 # ─────────────────────────────────────────────────────
+# BTC Risk-Off 안전 필터 (LCR 셋업 C 독립 채택, Phase 0 데이터로 검증)
+# ─────────────────────────────────────────────────────
+@dataclass
+class BTCRiskOffConfig:
+    """BTC 1h 급락 감지 시 신규 진입 자동 차단(쿨다운). 거래 엣지 아닌 *회피 룰*.
+
+    Phase 0(2년·187종목·n=13,887): BTC 동반 급락 시 알트 LONG +4h 평균 −0.65%
+    vs 단독 +0.39% — 1.03%pt 명백한 불리. 거래하지 않는 룰이라 사전확정 임계와 별개.
+    """
+    enabled: bool = True
+    drop_threshold_pct: float = 0.012     # BTC 1h 변화 ≤ -1.2% 면 트리거
+    cooldown_hours: float = 6.0           # 트리거 후 6h 신규 진입 금지
+
+
+BTC_RISK_OFF_CONFIG = BTCRiskOffConfig()
+
+
+# ─────────────────────────────────────────────────────
 # 전략 선택 (P2 — 라이브 활성 매수 전략)
 # ─────────────────────────────────────────────────────
 @dataclass
