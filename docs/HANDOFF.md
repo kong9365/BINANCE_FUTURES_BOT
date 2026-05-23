@@ -21,6 +21,12 @@
 > 풀-오토 LCR Phase 1~6 진행 중단. **그러나 셋업 C(BTC 동반 급락 시 진입 금지)는
 > 데이터로 명확히 검증됨** (단독 +0.39% vs 동반 −0.65% = 1.03%pt 스프레드). 거래 엣지
 > 아닌 *안전 필터*라 standalone 채택 가능. `docs/STRATEGY_REALISM_REVIEW.md §9` 참조.
+>
+> ✅ **셋업 C 구현 완료(2026-05-23, HEAD `2845934`)**: `strategy/btc_risk_off.py` +
+> `BTCRiskOffConfig`(기본 enabled, 1.2%/6h) + `main_7590._iter` 통합. BTC 1h 종가 변화
+> ≤ −1.2% 시 자동 6h 신규 진입 차단(쿨다운 만료 시 자동 해제, 중복 트리거 방지, Telegram
+> CRITICAL 알림). **거래를 *막기만* 하는 룰** — 자본 보존 우선. 단위테스트 9건, 전체 429 passed.
+> 실거래 GO는 여전히 **HOLD** (이 필터는 거래를 열지 않고 *닫기만* 함).
 
 ## Context
 v3.1.2 봇의 실거래 투입 전 안정화 작업을 다회 세션에 걸쳐 진행 중. 최근 세션에서
