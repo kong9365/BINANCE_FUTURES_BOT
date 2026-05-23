@@ -25,17 +25,27 @@ from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-_TIER1_VOL = 1_000_000_000.0
-_TIER2_VOL = 300_000_000.0
+_TIER1_VOL = 1_000_000_000.0   # >$1B
+_TIER2_VOL = 300_000_000.0     # >$300M
+_TIER3_VOL = 100_000_000.0     # >$100M (기존 봇 PairWhitelist 게이트)
+_TIER4_VOL = 30_000_000.0      # >$30M  (광범위 유니버스 진입대, 0.30% 슬립)
+# 그 외(≥$10M ~) → tier5(0.60% 슬립). $10M 미만은 호출자가 사전 필터(min_quote_volume_usd).
 
 
 def volume_tier(quote_volume_usd: float) -> int:
-    """24h 거래대금 → 슬리피지 티어(1 최유동 ~ 3 저유동)."""
+    """24h 거래대금 → 슬리피지 티어(1 최유동 ~ 5 저유동, ExecConfig 와 정렬).
+
+    2026-05-23: 광범위 유니버스($10M 가드) 도입에 따라 4/5 추가.
+    """
     if quote_volume_usd >= _TIER1_VOL:
         return 1
     if quote_volume_usd >= _TIER2_VOL:
         return 2
-    return 3
+    if quote_volume_usd >= _TIER3_VOL:
+        return 3
+    if quote_volume_usd >= _TIER4_VOL:
+        return 4
+    return 5
 
 
 @dataclass

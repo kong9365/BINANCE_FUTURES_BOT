@@ -105,6 +105,26 @@ def test_costs_reduce_pnl():
     assert p1 < p0
 
 
+def test_exec_config_tier_costs_include_4_5():
+    """광범위 유니버스용 tier 4/5 슬리피지가 기본값에 포함된다(0.30% / 0.60%)."""
+    cfg = pbt.ExecConfig()
+    assert cfg.slippage_by_tier[1] == 0.00050
+    assert cfg.slippage_by_tier[2] == 0.00100
+    assert cfg.slippage_by_tier[3] == 0.00150
+    assert cfg.slippage_by_tier[4] == 0.00300
+    assert cfg.slippage_by_tier[5] == 0.00600
+
+
+def test_tier5_slippage_reduces_pnl_more(tmp_path=None):
+    """동일 신호여도 티어 5(저유동) 비용이 티어 1(BTC급)보다 손익을 더 크게 깎는다."""
+    data = {"X": _uptrend_df()}
+    r1 = pbt.run_portfolio(data, tiers={"X": 1}, breakout_cfg=_CFG)
+    r5 = pbt.run_portfolio(data, tiers={"X": 5}, breakout_cfg=_CFG)
+    p1 = sum(t.pnl_usd for t in r1.trades)
+    p5 = sum(t.pnl_usd for t in r5.trades)
+    assert p5 < p1                          # tier5 슬리피지가 더 커서 pnl 작음
+
+
 def test_max_concurrent_limit():
     data = {"AAA": _uptrend_df(), "BBB": _uptrend_df(), "CCC": _uptrend_df()}
     tiers = {"AAA": 2, "BBB": 2, "CCC": 2}

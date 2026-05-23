@@ -166,8 +166,17 @@ def compute_signals(df: pd.DataFrame, cfg: BreakoutConfig) -> pd.DataFrame:
 @dataclass
 class ExecConfig:
     taker_fee: float = 0.00045
+    # 5티어 슬리피지(편도, 명목 대비) — universe.volume_tier 와 정렬:
+    #   1: 거래대금 >$1B (BTC/ETH 급, 0.05%)
+    #   2: >$300M  (대형 알트, 0.10%)
+    #   3: >$100M  (중형, 0.15%)
+    #   4: >$30M   (저유동 진입, 0.30%) — 광범위 유니버스용 추가(2026-05-23)
+    #   5: ≥$10M   (저유동 한계, 0.60%) — 광범위 유니버스용 추가
     slippage_by_tier: Dict[int, float] = field(
-        default_factory=lambda: {1: 0.00050, 2: 0.00100, 3: 0.00150})
+        default_factory=lambda: {
+            1: 0.00050, 2: 0.00100, 3: 0.00150,
+            4: 0.00300, 5: 0.00600,
+        })
     stop_slippage_pct: float = 0.0010   # 스톱 갭 통과 추가 슬리피지(편도)
     apply_funding: bool = True
     funding_interval_hours: float = 8.0

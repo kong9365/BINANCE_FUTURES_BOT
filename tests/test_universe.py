@@ -17,9 +17,12 @@ def _ticker(sym, qv):
 
 
 def test_volume_tier_bands():
-    assert uni.volume_tier(2e9) == 1
-    assert uni.volume_tier(5e8) == 2
-    assert uni.volume_tier(1.5e8) == 3
+    assert uni.volume_tier(2e9) == 1        # >$1B
+    assert uni.volume_tier(5e8) == 2        # >$300M
+    assert uni.volume_tier(1.5e8) == 3      # >$100M
+    assert uni.volume_tier(5e7) == 4        # >$30M (광범위 유니버스용)
+    assert uni.volume_tier(1.5e7) == 5      # ≥$10M (저유동 한계)
+    assert uni.volume_tier(0) == 5          # 경계: tier 최대
 
 
 def test_resolve_filters_sorts_excludes():
