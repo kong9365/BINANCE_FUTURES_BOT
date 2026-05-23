@@ -15,6 +15,12 @@
 > 영구 자산 = 검증 인프라(portfolio_backtest·cross_sectional·evaluate·universe·backfill_history).
 > 미래 *근본적으로 다른* 데이터/메커니즘이 동일 사전확정 기준 통과 시에만 배포 재검토.
 > 상세 = `docs/STRATEGY_REALISM_REVIEW.md §7-8` + Supabase `backtest_runs`. 실거래 GO = **HOLD**.
+>
+> 📊 **+1 추가 검증(2026-05-23): LCR(이벤트 반응형) Phase 0 무료 sanity → borderline FAIL.**
+> 셋업 A 단독(BTC 평온, n=8,851) +4h 평균 +0.387%로 비용 임계 0.5%에 0.11%pt 못미침 →
+> 풀-오토 LCR Phase 1~6 진행 중단. **그러나 셋업 C(BTC 동반 급락 시 진입 금지)는
+> 데이터로 명확히 검증됨** (단독 +0.39% vs 동반 −0.65% = 1.03%pt 스프레드). 거래 엣지
+> 아닌 *안전 필터*라 standalone 채택 가능. `docs/STRATEGY_REALISM_REVIEW.md §9` 참조.
 
 ## Context
 v3.1.2 봇의 실거래 투입 전 안정화 작업을 다회 세션에 걸쳐 진행 중. 최근 세션에서
