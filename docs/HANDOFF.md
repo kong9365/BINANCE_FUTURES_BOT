@@ -1,6 +1,24 @@
 # Binance Futures Bot — 세션 연속성 핸드오프 (컨텍스트 초기화 후 재개용)
 
-> 최종 갱신: 2026-05-27 (**v3.2.0 청사진 리팩토링 M0~M6 모두 완료 ✅ Phase 1.5 대기**)
+> 최종 갱신: 2026-05-27 (**M0~M12 모두 완료 ✅ — 운영자 결정 대기**)
+>
+> 🎯 **M12 결과 (2026-05-27): DailyTSMOMDonchianSkill testnet 1년 1d 실측 = FAIL (6/7).**
+>
+> - **n=4** (min 200), PF=0.401, Expectancy_R=-0.24, MDD=27.10%, top3_excl_PF=0.0
+> - setup_registry status: **DISABLED 자동** (6 criteria failed)
+> - 핵심 원인: *데이터 부족* (testnet 1년 × 3종목 → trades=4)
+> - 자세히: [M12_R0_DECISION_REPORT.md](M12_R0_DECISION_REPORT.md), [SETUP_VERIFICATION_REPORT_v3_2_0.md](SETUP_VERIFICATION_REPORT_v3_2_0.md)
+>
+> **운영자 결정 옵션** (M12 보고서 §3):
+> - **옵션 A (권장)**: mainnet read-only (USE_TESTNET=false 임시) + 18~50 종목 + 2~5년 재실행
+>   ```
+>   USE_TESTNET=false python scripts/run_m11_backtest.py --backfill --universe-size 18 --years 3
+>   ```
+> - **옵션 B (청사진 §7.5 Stage 3)**: Manual / Buy-and-hold + 50d MA / 다른 archetype
+> - **옵션 C**: HANDOFF "알파 영구 중단" (2026-05-23) *재확정* — 거버넌스 인프라 완성의 가치만 인정
+>
+> **변하지 않은 사실**: 본 리팩토링의 핵심 가치 = *거버넌스 인프라 완성* — M10 대시보드 (localhost:8501) 에서 실시간 확인 가능.
+> 실거래 GO 여전히 **HOLD** (운영자 결정 후 진행).
 >
 > 🎉 **2026-05-27: v3.2.0 청사진 리팩토링 M0~M6 완료.**
 >
