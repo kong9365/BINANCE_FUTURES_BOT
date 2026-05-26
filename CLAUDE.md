@@ -1,25 +1,33 @@
-# Binance Futures Bot v3.1.1 — Claude Code Guide
+# Binance Futures Bot v3.2.0 — Claude Code Guide
+
+> **v3.2.0 청사진 리팩토링** 진행 중 (2026-05-26~). 4-Layer + 5-Agent + ALCOA+ + GMP. 상세 = [SYSTEM_DESIGN_BLUEPRINT.md](SYSTEM_DESIGN_BLUEPRINT.md) (2,601줄) + [docs/REFACTOR_PLAN_v2_BLUEPRINT.md](docs/REFACTOR_PLAN_v2_BLUEPRINT.md).
 
 ## What this project is
 
 USDT-M Perpetual 선물 단타 자동매매 봇. 자본 $1,000~$10,000 대상. 학술 데이터 기반 보수적 설계 (참고: 단타 80~97% 손실, BIS WP#1087, NYU Stern 2022).
 
 **전체 명세서**:
-- `docs/SPEC_v3.1.md` (5,160줄) — 메인 명세서, 모든 결정의 근거
-- `docs/SPEC_v3.1_APPENDIX_E.md` ★ — **v3.1.1 보호 자산 정책 보완** (필독)
+- [SYSTEM_DESIGN_BLUEPRINT.md](SYSTEM_DESIGN_BLUEPRINT.md) ★ — v3.2.0 청사진 (4-Layer + 5-Agent + ALCOA+ + GMP)
+- [docs/REFACTOR_PLAN_v2_BLUEPRINT.md](docs/REFACTOR_PLAN_v2_BLUEPRINT.md) ★ — 리팩토링 마스터플랜 v2 (M0~M6)
+- [docs/SPEC_v3.1.md](docs/SPEC_v3.1.md) (5,160줄) — v3.1 메인 명세서, 안전 룰 근거
+- [docs/SPEC_v3.1_APPENDIX_E.md](docs/SPEC_v3.1_APPENDIX_E.md) — v3.1.1 보호 자산 정책 (E-1~E-8) + v3.2.0 (E-10 2-tier hierarchy)
 
-코드 작성 전 항상 해당 §섹션 view. 두 문서 모두 참조.
+코드 작성 전 항상 해당 §섹션 view. 4개 문서 모두 참조.
 
 ## How to work on this project
 
 ### TIER 1 — HARD RULES (위반 시 작업 실패)
 
-1. **명세서 우선**: 모든 모듈 작업 전 `docs/SPEC_v3.1.md` + `docs/SPEC_v3.1_APPENDIX_E.md`의 해당 §섹션 먼저 view.
-2. **Plan Mode 먼저**: 새 파일 작성·기존 파일 큰 수정 전, plan만 보여주고 사용자 승인 후 코드.
-3. **세션 1개 = 모듈 1개**: 한 세션에서 2개 이상 모듈 동시 작성 금지. 끝나면 `/clear` 안내.
-4. **보안 절대 룰**: API 키·시크릿은 코드·로그·주석 어디에도 출력 금지. `.env`만 사용.
-5. **테스트 필수**: 모든 신규 모듈은 `tests/test_<module>.py` 함께 작성.
-6. ★ **보호 자산 절대 룰** (v3.1.1): protected_symbols (BTCUSDT/ETHUSDT/HOLOUSDT/LYNUSDT)는 봇이 거래 못함. 명시적 차단 룰 절대 우회 금지.
+1. **명세서 우선**: 모든 모듈 작업 전 청사진 + REFACTOR_PLAN_v2 + SPEC + APPENDIX_E 의 해당 §섹션 먼저 view.
+2. **Plan Mode 먼저**: 새 파일 작성·기존 파일 큰 수정 전, plan만 보여주고 사용자 승인 후 코드. (단 운영자가 "단계별 검증 + 무한 진행" 명시 승인한 마일스톤 작업은 plan 재확인 생략 가능)
+3. **세션 1개 = 마일스톤 1개**: M0~M6 각각 한 세션. 끝나면 `/clear` + git push 후 다음 마일스톤.
+4. **보안 절대 룰**: API 키·시크릿은 코드·로그·주석 어디에도 출력 금지. `.env`만 사용. `git add .` / `-A` 절대 금지 (명시 파일 add만).
+5. **테스트 필수**: 모든 신규 모듈은 `tests/test_<module>.py` 함께 작성. pytest 통과 의무.
+6. ★ **보호 자산 절대 룰** (v3.1.1 + 청사진 §10.1 #2): protected_symbols (**BTCUSDT/ETHUSDT/HOLOUSDT/CFXUSDT/LYNUSDT/INJUSDT** — 6개) 는 봇이 거래 못함. 명시적 차단 룰 절대 우회 금지.
+7. ★ **9개 실패 strategy 재시도 금지** (청사진 §10.1 #9): OI-급증, 돌파 1h, 펀딩 페이드, ORB, CSM, LCR, CCS-Lite, ML EV, Pair stat-arb.
+   - **조건부 완화 (2026-05-26 운영자 명시 GO)**: 1d 돌파/Donchian 의 *완전 재검증*은 운영자 권장 **7기준** (n≥200 / Net PF≥1.25 / Expectancy_R>0 / avg_win/avg_loss≥1.5 / MDD≤25% / single_symbol<25% / **상위 3종목 제거 PF≥1.0**) 통과 시 R0_QUALIFIED 허용. 단순 재시도(같은 데이터 + 같은 임계)는 여전히 금지.
+   - top3_excluded_pf 기준은 2026-05-22 A2-② 발견 (top8 PF 2.20 → ZEC 단일 97% 기여 → 사실 PF≈1.0) 의 재발 방지.
+8. ★ **GitHub 중심 워크플로우** (운영자 결정 2026-05-26): 매 세션 시작 `git pull` + `docs/HANDOFF.md` + `docs/REFACTOR_M<N-1>_REPORT.md` 확인. 종료 시 `pytest` + `REFACTOR_M<N>_REPORT.md` + `HANDOFF.md` 갱신 + 명시 add + commit + push.
 
 ### TIER 2 — 코딩 컨벤션
 
@@ -111,7 +119,7 @@ Python 3.10+, python-binance, openai, pandas, numpy, pyyaml, sqlite3, pytest, py
 pytest tests/                      # 전체 테스트
 pytest tests/test_capital_manager.py -v  # ★ 보호 자산 검증
 pytest tests/test_pair_whitelist.py -v   # ★ protected_symbols 검증
-python -c "from config.settings import PAIR_WHITELIST_CONFIG; print(PAIR_WHITELIST_CONFIG.protected_symbols)"  # ['BTCUSDT', 'ETHUSDT', 'HOLOUSDT', 'LYNUSDT']
+python -c "from config.settings import PAIR_WHITELIST_CONFIG; print(PAIR_WHITELIST_CONFIG.protected_symbols)"  # ['BTCUSDT', 'ETHUSDT', 'HOLOUSDT', 'CFXUSDT', 'LYNUSDT', 'INJUSDT']
 ```
 
 ## Common pitfalls (이 프로젝트 특유)
@@ -134,7 +142,7 @@ python -c "from config.settings import PAIR_WHITELIST_CONFIG; print(PAIR_WHITELI
 | 사이즈 계산 기준 | `current_capital` | `available_balance` (마진 락 제외) |
 | 일일 손실 기준 | 현재 자본 | `daily_start_wallet_balance` |
 | MDD 기준 | 현재 자본 | `initial_wallet_balance` (최초) |
-| 보호 종목 | 없음 | `protected_symbols`: BTCUSDT, ETHUSDT, HOLOUSDT, LYNUSDT |
+| 보호 종목 | 없음 | `protected_symbols`: BTCUSDT, ETHUSDT, HOLOUSDT, CFXUSDT, LYNUSDT, INJUSDT (6개, v3.2.0 정합) |
 | Spot 격리 | 묵시적 | 명시적 (API 키 권한 + 코드 가드) |
 | 시작 시퀀스 | 단순 | 초기 자본 기록 + 보호 종목 알림 + API 권한 검증 |
 

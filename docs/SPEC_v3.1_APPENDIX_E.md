@@ -988,12 +988,76 @@ async def _verify_api_key_permissions(self):
 
 ---
 
+## E-10. 2-tier Risk Hierarchy (v3.2.0 신규, 청사진 §7.4 정합)
+
+**근거**:
+- 청사진 v1.0 §7.4 — 3-tier hierarchy (warn / soft / hard) + emergency 백스톱 명시
+- 운영자 결정 2026-05-26 — **2-tier 단순화** (soft 제거, 초기 운영 단순성 우선)
+- SPEC v3.1.1 §9 max_daily_loss_pct = 0.015 (1.5%) **유지** (TIER 3 임계 변경 금지 정합)
+
+### E-10-1. 일일 손실 2-tier
+
+| Tier | 임계 | 동작 | 도달 가능 |
+|---|---|---|---|
+| **warn** | -1.0% | Slack/Telegram 경고만, 거래 계속 | ✓ |
+| **hard** | -1.5% (SPEC v3.1.1) | KillSwitch 자동 활성화 (`source="daily_loss_hard"`) | ✓ |
+
+> 청사진 §7.4 의 `daily_soft_pct: -2.0` 는 *제거* — hard -1.5% 에서 이미 차단되어 도달 불가하기 때문.
+> 청사진 -3.0% / -5.0% (emergency) 는 *최종 백스톱 Stage 3* 로만 명시 (실제로는 -1.5% 에서 차단).
+
+### E-10-2. MDD 2-tier (선택 도입)
+
+| Tier | 임계 | 동작 |
+|---|---|---|
+| warn | -10.0% | Slack 경고 |
+| hard | -15.0% (SPEC v3.1.1) | KillSwitch 자동 활성화 |
+
+- 청사진 -25% / -30% 는 *최종 백스톱 Stage 3* (90d rolling 또는 -25% MDD) 로만 작동
+- SPEC v3.1.1 의 `max_total_drawdown_pct = 0.15` 그대로 유지
+
+### E-10-3. 구현 위치
+
+- `governance/risk_hierarchy.py` (M4 신규) — `RiskHierarchyConfig` dataclass + `check_warn / check_hard` 헬퍼
+- 기존 `trading/risk_manager.py` `_check_daily_loss` / `_check_total_drawdown` 은 *그대로 작동* (hard 임계)
+- warn 임계는 `ops/system_health_monitor.py` 또는 신규 governance 모듈에서 5분 주기 체크
+
+### E-10-4. 명세
+
+```python
+@dataclass
+class RiskHierarchyConfig:
+    """2-tier risk hierarchy (운영자 결정 2026-05-26)."""
+
+    # Daily loss
+    daily_warn_pct: float = 0.010   # -1.0% → Slack 경고
+    daily_hard_pct: float = 0.015   # -1.5% → KillSwitch (SPEC v3.1.1 유지)
+
+    # MDD
+    mdd_warn_pct: float = 0.10      # -10% → Slack 경고
+    mdd_hard_pct: float = 0.15      # -15% → KillSwitch (SPEC v3.1.1 유지)
+
+    # Stage 3 백스톱 (청사진 §7.5)
+    stage3_rolling_90d_pct: float = 0.10   # 90d 누적 -10% → KillSwitch
+    stage3_mdd_pct: float = 0.25           # 90d MDD -25% → KillSwitch
+```
+
+### E-10-5. 검증
+
+- `pytest tests/test_risk_hierarchy_2tier.py`:
+  - daily PnL -0.9% → no action
+  - daily PnL -1.0% → Slack 경고만 (거래 계속)
+  - daily PnL -1.4% → Slack 경고만
+  - daily PnL -1.5% → KillSwitch 자동 활성화 + `audit_log` row `KILL_SWITCH_ACTIVATED`
+  - daily PnL -2.0% → *이미 차단된 상태* (도달 X, 정상 시나리오)
+
+---
+
 ## 부록 E 끝
 
 본 부록은 SPEC_v3.1.md의 일부로 통합되어야 하며, 운영 시 다음을 함께 참조:
 
-- 부록 A (변경 매트릭스) — 향후 v3.1.1 항목 추가 필요
-- 부록 C (운영 체크리스트) — Step 7 운영자 확인 절차 추가 필요
-- 부록 D (모듈 의존성 그래프) — CapitalManager 의존성 추가
+- 부록 A (변경 매트릭스) — 향후 v3.1.1 + v3.2.0 항목 추가 필요
+- 부록 C (운영 체크리스트) — Step 7 운영자 확인 절차 + M0~M6 단계별 검증 추가
+- 부록 D (모듈 의존성 그래프) — CapitalManager + KillSwitch + 5-Agent 의존성 추가
 
 **다음 단계 권장**: 코드 작성 시 새로운 세션 `세션 2.5: CapitalManager + PairWhitelist 보호 종목` 진행 (SESSION_PROMPTS.md 참조).

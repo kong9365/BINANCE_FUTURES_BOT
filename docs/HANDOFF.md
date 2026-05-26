@@ -1,9 +1,28 @@
 # Binance Futures Bot — 세션 연속성 핸드오프 (컨텍스트 초기화 후 재개용)
 
-> 최종 갱신: 2026-05-21 (전략 개편 세션 완료 — **데이터 누적 대기 진입**)
-> 본 문서는 `C:\Users\jaeho\.claude\plans\python-binance-rosy-lollipop.md`(세션 플랜
-> 파일)의 저장소 미러본이다. 컨텍스트 초기화와 무관하게 추적된다.
+> 최종 갱신: 2026-05-26 (**v3.2.0 청사진 리팩토링 M0 시작 — 알파 재검토 시나리오**)
+> 본 문서는 [docs/REFACTOR_PLAN_v2_BLUEPRINT.md](REFACTOR_PLAN_v2_BLUEPRINT.md) (마일스톤 M0~M6) 의 컨텍스트 진행 기록.
+> 멀티 PC 연속성: 모든 세션 시작 시 `git pull` + 본 문서 + `REFACTOR_M<N>_REPORT.md` 확인 필수.
 > (세션 0~12 구현 완료 시점의 옛 핸드오프는 git 히스토리에 보존됨.)
+>
+> 🆕 **v3.2.0 청사진 리팩토링 시작(2026-05-26) — 알파 재검토 시나리오 운영자 명시 GO.**
+>
+> **배경**: [SYSTEM_DESIGN_BLUEPRINT.md](../SYSTEM_DESIGN_BLUEPRINT.md) (2,601줄) 의 4-Layer + 5-Agent + ALCOA+ + GMP 적용. 운영자 결정 8건 ([REFACTOR_M0_BASELINE.md](REFACTOR_M0_BASELINE.md) §운영자 결정).
+>
+> **HANDOFF "알파 영구 중단" 재검토 (운영자 결정 #v2-1)**:
+> 9개 실패 strategy 누적 결론 ("알파 추구 액티브 매매 안 함", 2026-05-23) 은 *현재 데이터 + 현재 임계* 기준이었음. 본 리팩토링은 다음을 추가:
+>
+> 1. **운영자 권장 7기준 게이트** (M2): n≥200 / Net PF≥1.25 / Expectancy_R>0 / avg_win/avg_loss≥1.5 / MDD≤25% / single_symbol<25% / **상위 3종목 제거 PF≥1.0** (← ZEC 단일종목 97% 행운 방어)
+> 2. **ALCOA+ 트레이서** (M1) — 모든 SignalDecision/AgentReview/AuditLog 영속 + chain hash
+> 3. **5-Agent 검토단** (M3) — Strategy/Risk/Execution/Data/Ops 다관점
+> 4. **KillSwitch 어댑터** (M1) — 기존 btc_risk_off + 파일 기반 통합
+> 5. **Stage 3 백스톱** (M4) — 90d -10% 또는 MDD -25% → 자동 archetype 재고
+>
+> **CLAUDE.md TIER 1 #9 조건부 완화** (운영자 명시 GO 2026-05-26): 1d 돌파/Donchian *완전 재검증* 만 허용. 같은 데이터+같은 임계 단순 재시도는 여전히 금지.
+>
+> **실거래 GO 여전히 HOLD**. M2 7기준 통과 시에만 R0_QUALIFIED → Phase 1.5 micro-live 별도 진행.
+>
+> **M0 작업 시작 (2026-05-26)**: CLAUDE.md v3.2.0 업데이트 + SPEC E-10 (2-tier hierarchy) + 본 HANDOFF 재검토 명시. pytest 기준선 = **718 passed** (이전 HANDOFF 2026-05-25 706 + 미반영 12).
 >
 > 🟥 **현재 상태(2026-05-23): 검증 종료(재확정) — 5개 전략군 모두 불합격.**
 > 광범위 유니버스(≥$10M ~183종목, 2년 1.98M ohlcv) + 새 메커니즘 2개(ORB 인트라데이,
@@ -27,6 +46,139 @@
 > ≤ −1.2% 시 자동 6h 신규 진입 차단(쿨다운 만료 시 자동 해제, 중복 트리거 방지, Telegram
 > CRITICAL 알림). **거래를 *막기만* 하는 룰** — 자본 보존 우선. 단위테스트 9건, 전체 429 passed.
 > 실거래 GO는 여전히 **HOLD** (이 필터는 거래를 열지 않고 *닫기만* 함).
+>
+> ✅ **Microstructure Phase 2 Universe 확장 완료(2026-05-24) — Top-10 고정 폐기, Dynamic Tiered Universe 채택.**
+> 운영자 critique 반영: Top-10 고정은 *수집기 검증용* 으로는 적절했으나 *최종 알파 검증용* 으로는 너무 좁음. Phase 2 데이터 누적을 위해 동적 Tier 분류 추가:
+>
+> **Tier 구조** (수집 *전용*, 실거래 universe 와 분리 — PAIR_WHITELIST.protected_symbols 정책 무변경):
+> - **Tier 0 (core)**: BTC/ETH/SOL/XRP/DOGE/BNB — 항상 포함, depth+trade+force
+> - **Tier 1 (full)**: 24h quoteVolume top N (default 20, CLI 15 보수) — depth+trade+force
+> - **Tier 2 (light)**: 다음 M (default 50, CLI 30 보수) — trade+force (depth 미수집, 부하 감소)
+> - **Tier 3 (monitor only)**: 기존 OHLCV/OI/Funding 경로 (`collect_oi` — 본 모듈 무관)
+>
+> **commodity-like 강화 (운영자 critique #3)**: exact symbol set `{XAUUSDT, XAGUSDT, CLUSDT, BZUSDT}` 기본 제외 (prefix 단독 사용 금지). exchangeInfo `contractType=PERPETUAL AND quoteAsset=USDT AND status=TRADING` 필수 통과. `--include-commodity-like` 옵션으로 실험적 포함 가능.
+>
+> **메타 lineage 테이블 (운영자 critique #1)**: `collection_universe_snapshots` (ts, tier, symbol, quote_volume, category, stream_types, source, resolver_version v1) — Phase 3 IC 분석 시 point-in-time universe 복원 보장. MCP migration `collection_universe_snapshots`.
+>
+> **multiplex 우선 + 보수 운영 (운영자 critique #2)**: 단일 multiplex socket (raw `websockets`) 으로 모든 stream 묶음 → DNS/TLS handshake 1회. python-binance 1.0.36 의 `futures_multiplex_socket` 이 depth 누락 버그 + `@aggTrade` 0건 (Binance 측 throttle) 발견 → URL 폴백 `<symbol>@trade` 채택 (raw trade, 더 granular, 동일 의미 - agg_trade_id 컬럼 그대로 사용). max_queue_size=1000, ping_interval=20s, 지수 backoff 재연결.
+>
+> **검증** (5min smoke, tier1=15/tier2=30, 51 symbols, 73 streams):
+> - **l2=5,682 / agg=295,280 / liq=0 / reconnects=0 / avg latency 149ms / dedup 0**
+> - Tier 0 core ✓ / Tier 1 (HYPE, ZEC, NEAR, BSB, BEAT, SUI, GRASS, IN, ONDO, BILL, GMT, 1000PEPE, TAO, WLD, GENIUS) ✓
+> - depth 21 streams (core 6 + tier1 15) — Tier 2 30 심볼은 depth 미수집 (의도)
+> - trade 51 streams (전 tier) / forceOrder 1 multiplex
+> - commodity-like 0 (XAU/XAG/CL/BZ 제외 확인)
+> - `collection_universe_snapshots` 51 rows 적재 ✓
+>
+> **신규**: `data/microstructure_universe.py` (resolver + helpers), `tests/test_microstructure_universe.py` (21 tests), `config/settings.py` (`MicrostructureUniverseConfig`). **수정**: `data/ws_collector.py` (symbol_streams override + raw multiplex), `scripts/run_ws_collector.py` (--tiered-universe + 5 CLI options). 단위테스트 27건 추가 (전체 **684 passed**, 회귀 0).
+>
+> **알파/ML/R0/진입/주문 경로 일체 미수정**. RiskManager/KillSwitch/보호종목 정책 그대로. 실거래 GO **HOLD** 무기한 유지.
+>
+> ✅ **운영 hardening (Phase 2-D, 2026-05-24)** — 운영자 가이드 반영:
+> 1. **`agg_trades.source_stream` 컬럼 추가** (MCP migration `agg_trades_source_stream`) — `'aggTrade'` vs `'trade'` lineage 명시. Phase 3 CVD 분석 시 혼동 방지. `parse_agg_trade_message` 가 자동 채움 (msg 의 `a` 필드면 aggTrade, `t` 면 trade).
+> 2. **23h 선제 재연결** — Binance WS 24h disconnect 정책을 *예측된 cycle* 로 처리. `_run_raw_multiplex_loop` 가 23시간 도달 시 정상 break → 즉시 재연결. `CollectorStats.preemptive_reconnects` 별도 카운터.
+> 3. **`scripts/ws_health_report.py`** — 운영자 9-지표 일일 heartbeat: stream_count / l2-agg-liq row counts 24h / source_stream 별 / last_msg_at / latency / snapshot_count. `--telegram` 발송 옵션. `--window-hours 168` 로 7일 점검.
+> 4. **`CollectorStats` 강화**: `p95_latency_ms` property, `queue_overflow_count` counter, `record_latency()` 메모리 cap (10k samples).
+>
+> 단위테스트 4건 추가 (전체 **688 passed**, 회귀 0). 30s smoke 결과: source_stream='trade' 233 rows 적재 확인, latency_samples 정상 누적, preemptive_reconnects=0 (아직 23h 미도달).
+>
+> **운영자 9-지표 (헬스 리포트 명시)**:
+> 1. stream_count 2. l2_book_snapshots_24h 3. agg_trades_24h (+source_stream 분리) 4. liquidations_24h 5. avg/p95 latency_ms 6. reconnect_count 7. queue_overflow_count 8. last_message_age_sec 9. collection_universe_snapshot_count.
+>
+> **다음 단계 (개발 X, 운영 안정화)**:
+> - BinanceWSCollect Windows Task 등록 (운영자 머신, `run_ws_collector.bat.template` 참조)
+> - 24h 후 `ws_health_report.py --window-hours 24` 1차 점검
+> - 7일 후 `--window-hours 168` 으로 row 폭증 점검 (agg ≈ 85M/24h 추정 → 7일 ≈ 595M, Supabase free tier 8GB → 모니터링 필수)
+> - 60-90일 후 Phase 3 (IC 분석 → Rule-based) 재승인 요청
+>
+> 🆕 **Phase 2-E 완료(2026-05-25) — Disk Saturation Mitigation + 1m Aggregate + 새 Supabase 프로젝트.**
+>
+> **사건 요약**: Phase 2 데이터 누적 30분만에 무료 Supabase 디스크(2GB) 96.5% 도달 → Postgres crash → WAL replay 완료 후 *첫 WAL write 가 디스크 부족* → 무한 recovery loop → 자력 복구 불가. 운영자 결정: A. 새 Supabase 프로젝트 생성.
+>
+> **신규 Supabase 프로젝트**: `Binance-MS` (id `fsahlcmidhqdaxhqyhyk`, ap-southeast-1, FREE). 6 테이블 schema 재적용(MCP migration `all_microstructure_schema`): l2_book_snapshots, agg_trades(+source_stream), liquidations, collection_universe_snapshots, agg_trades_1m, backtest_runs. RLS off (무료 단순화).
+>
+> **신규 코드 (Phase 2-E)**:
+> - `data/aggregator_1m.py` — Trade-tick → 1분 OHLC+volume+CVD 집계기. 메모리 상태 + Supabase upsert. WSCollector 의 write_sem 공유. 단위테스트 18.
+> - `scripts/cleanup_old_data.py` — raw TTL DELETE (agg 1h / l2 6h). dry-run 지원. PostgREST 기반.
+> - `scripts/run_cleanup.bat` + Windows Task `BinanceWSCleanup` (매시간 trigger).
+> - 수정: `ws_collector.py` (handle_agg_trade 가 _agg_1m.record_trade 동시 호출 + _periodic_flush_loop 가 30s 마다 _agg_1m.flush_completed_buckets), `ws_health_report.py` (`agg_trades_1m_24h` 지표 추가).
+> - 단위테스트 18건 추가 (전체 **706 passed**, 회귀 0).
+>
+> **보존 정책**: raw `agg_trades` 1h TTL / `l2_book_snapshots` 6h TTL / `agg_trades_1m` **영구 보존**(Phase 3 IC 입력) / liquidations·snapshots 영구. 60일 추정 디스크 ~700MB (Supabase free 2GB 안전).
+>
+> **검증**: 새 프로젝트에 데몬 재가동 후 3분만에 l2 5,920 / agg 111,000 / snap 51 정상 적재. WinError 10035 / PGRST002 / 57P03 *모두 사라짐*. agg_trades_1m 은 분 boundary 에서 첫 flush 대기.
+>
+> **3개 Windows Tasks 운영 중**:
+> - `BinanceWSCollect` (AtLogOn, tier1=15 tier2=30, multiplex, 23h preemptive reconnect)
+> - `BinanceWSCleanup` (매시간, raw TTL DELETE)
+> - `BinanceWSHealthDaily` (매일 09:00, 9-지표 + Telegram)
+>
+> 실거래 GO **HOLD** 무기한 유지. Phase 3 (60-90일 후 IC 분석) 재승인 필요.
+>
+> 🚀 **Phase 2 Deploy 완료(2026-05-24)** — C:\bots\BINANCE_FUTURES_BOT 클론으로 코드 동기화 + Windows Tasks 등록:
+> - `BinanceWSCollect` (사용자 logon trigger, 무한 실행, 5회 재시작, 배터리 허용)
+> - `BinanceWSHealthDaily` (매일 09:00, --window-hours 24 --telegram)
+> - **WinError 10035 fix**: 73 streams × 병렬 buffer flush → Supabase connection pool 포화 발견. `asyncio.Semaphore(1)` 공유로 모든 buffer 의 Supabase 쓰기 직렬화 → 즉시 해결. 단위테스트 39 passed 유지.
+> - 클론 동기화 파일: data/{ws_collector.py, microstructure_universe.py, persistence.py}, scripts/{run_ws_collector.py, ws_health_report.py, run_ws_collector.bat.template}, config/settings.py, tests/{test_microstructure_universe.py, test_ws_collector.py}.
+> - 클론 신규 .bat 파일: run_ws_collector.bat (tier1=15 tier2=30), run_ws_health.bat (--telegram).
+>
+> **자동 진행 중**: BinanceWSCollect 데몬이 매 logon 시 자동 시작, 23h 선제 재연결, 매일 09:00 헬스 리포트 → Telegram.
+>
+> ✅ **Microstructure Phase 1 완료(2026-05-24) — 데이터 레일 준비 끝, 알파 빌드 *없음* (의도된 보류).**
+> 9 strategy fail (OHLCV+OI+funding+ML) 누적 결론: 우리 데이터에 추출 가능한 알파 없음. 운영자 critique:
+> *"지금은 신호 찾기보다 실시간 마이크로구조 데이터 수집 체계 확보 및 검증"*. Phase 1 = 데이터 인프라만.
+>
+> **Phase 1-A (코드 + 스키마)**: Supabase MCP `apply_migration microstructure_tables` 으로 3 신규 테이블 생성 — `l2_book_snapshots`(1초 bucket, UNIQUE symbol+ts), `agg_trades`(UNIQUE symbol+agg_trade_id), `liquidations`(UNIQUE symbol+exchange_ts+side+price+qty). 모든 테이블 `received_ts` + `latency_ms` GENERATED column + (symbol,ts)/(ts) 인덱스. `data/ws_collector.py` async 3-stream (depth@100ms→1초 downsample / aggTrade tick-full / forceOrder@arr multiplex), batch upsert(1000 rows/5s), 자동 재연결(지수 backoff), max_queue_size=1000(기본 100 은 HYPE 등 overflow). 단위테스트 29건(파싱/dedup/batch/latency/lifecycle). 전체 657 passed.
+>
+> **Phase 1-B (smoke test 60s, BTC/ETH/SOL)**: l2=169 rows(3 syms × 57s), agg=1251 rows(BTC629/ETH486/SOL136), liq=0, reconnects=0, **avg latency 50.7ms** (good). UNIQUE 작동 (0 dup), latency_ms generated column 정상.
+>
+> **Phase 1-C (5min top-10 scale test)**: SOL/XAU/ZEC/XAG/CL/DOGE/LAB/HYPE/XRP/BZ universe → l2=2760, agg=12,765, **liq=10 (실 liquidation 캐치)**, reconnects=1(HYPE queue overflow 자동 회복 → max_queue_size 1000 으로 패치). HYPE liq notional avg $3558 BUY / $641 SELL — 실 트레이딩 사이즈 검증.
+>
+> **자동 진행 보류 (운영자 critique)**: 알파/ML/R0/진입 로직 빌드 *금지*. Phase 2 = 60-90일 데이터 누적 (운영자 시간 0, Windows Task 로 BinanceWSCollect 등록). Phase 3 = IC 분석 → Rule-based Layer 2 → R0 평가 (LightGBM 은 IC 입증 후만).
+>
+> 신규 모듈: `data/ws_collector.py`, `scripts/run_ws_collector.py`, `scripts/run_ws_collector.bat.template`, `tests/test_ws_collector.py`. aiohttp 기본 AsyncResolver 가 Win/Py3.14 에서 DNS 실패 → ThreadedResolver 패치 (script 시작 시 monkey-patch).
+>
+> Windows Task 등록: 운영자가 `scripts/run_ws_collector.bat.template` 을 `C:\bots\BINANCE_FUTURES_BOT\run_ws_collector.bat` 으로 복사 + 경로 수정 후 `Register-ScheduledTask -AtStartup -AllowStartIfOnBatteries ...` (BinanceOICollect 패턴 동일, .bat 안 주석에 정확한 명령 포함).
+>
+> 실거래 GO **HOLD** 무기한 유지. R5 도달 + 운영자 명시 승인 필수.
+>
+> 🟥 **ML EV Engine v2 R0 결과(2026-05-24, run_id `ml_ev_r0_20260524T101148Z`): FAIL — 9번째 시도 정직 종료.**
+> 운영자 통찰 ("진짜 퀀트는 조건부 확률 추정 + EV 진입") 반영하여 binary classification (v1) 폐기 후 forward-return regression v2 채택. Ridge + LightGBM 듀얼 동시 학습, 41 피처(EMA·VWMA·BB·RSI·OI·funding·funding_remaining·BTC trend/corr·6-state regime·시간 cyclic·횡단면 percentile), 14mo train / 4mo val / 6mo OOS 엄격 분리, EV 진입(r_hat > cost 0.16% + 0.20% margin). 29 심볼 × 163k train obs / 106k OOS obs.
+>
+> **결과**: LGBM Spearman = **+0.0004** (~ random), Ridge Spearman = −0.0100. 즉 *모델이 forward return 에 대한 의미 있는 예측력 없음*. EV-진입 352 trades 가 발생했으나 cross-sectional 69% positive 임에도 **MDD 49.3%** + **단일 종목 39% 지배** → "trading PF 1.98 / Sharpe 4.14" 는 small subset 우연. 사전확정 10기준 중 6 PASS / 4 FAIL. Spearman 0.05 미달 (regression sanity FAIL) 이 핵심.
+>
+> 진단: 1.98M ohlcv 위 41 피처로도 1h alt 4h forward return 의 *조건부 평균*에 거의 정보 없음. 시장이 (a) 효율적이거나 (b) 우리 피처에 잡히지 않는 정보(L2 orderbook, 뉴스, 거래소 간 흐름)에 의해 움직이거나 (c) signal-to-noise 가 비용 0.16% RT 보다 낮음. 8 rule-based + 1 ML 모두 동일 결론으로 수렴 → 우리 봇 설정(소액·USDT-M·30s 폴링·OHLCV+OI+funding 만)의 *진입 결정* 알파는 데이터에 존재하지 않거나 추출 불가.
+>
+> **정직 종료 처리(9번째 시도, 계획서 §FAIL 시 규칙)**: target 변경·feature 추가·모델 변형 재시도 금지. 영구 자산 = 9 전략 검증 인프라 + ML 파이프라인(R0/R1 재사용 가능) + 안전 게이트(BTC risk-off). 실거래 GO **HOLD** 무기한.
+> 신규 모듈: `strategy/indicators.py`(VWMA/BB/RSI), `analytics/regime_detector_v2.py`(6-state), `analytics/feature_engineering.py`(41 피처, 룩어헤드 차단 단위테스트), `analytics/ev_model.py`(Ridge+LightGBM wrapper + save/load), `analytics/ml_backtest.py`(R0/R1 러너), `scripts/run_ml_r0.py`(CLI). 단위테스트 55건 추가(전체 628 passed).
+>
+> 🟥 **Pair Stat-Arb v1 R0 결과(2026-05-24, run_id `pair_arb_r0_20260524T084130Z`): FAIL — 8번째 시도 정직 종료.**
+> direction-neutral cointegrated pair mean-reversion 을 7 단일자산 방향성 실패와 *카테고리 자체* 다른 시도로 채택. Supabase MCP 로 top-50 거래대금 유니버스 산출(SOL, XAU, ZEC, XAG, CL, DOGE, LAB, HYPE, XRP, BZ + 40개) → 1,225 후보 페어 중 *7 페어만* cointegrated(p<0.01 + Hurst<0.4 + half_life<14d). 157 trades, PF 0.81, Sharpe −0.73, MDD 80.7%, 횡단면 양(+) 42.9%, **단일 페어 70.4% 지배**(XAU-XAG 가능). 사전확정 7기준 중 *6개 FAIL*(MDD sanity 1개만 vacuous PASS).
+>
+> 진단: 두 번째 실험은 (a) 알파벳 정렬 universe(저유동성 메메·신규상장 다수) → spurious cointegration 30 페어 → 99% MDD 단일 트레이드 폭락. 1차 fix 로 *최근 30일 거래대금 ranking* 으로 universe 교체 → 진짜 메이저는 7 페어만 cointegrated → 그것마저 net 손실. 본질: **크립토 메이저 perp 은 BTC 주도 상관 + 변동성으로 cointegration 깨짐, 2-leg 비용(0.33% round-trip)이 spread 변동을 압도**.
+>
+> 8 전략 모두 사전확정 FAIL → **알파 추구 액티브 매매 영구 중단** (실거래 GO HOLD 무기한). 운영자 통찰("실거래 가능 전략 있을 것")은 *우리 봇 설정(소액·USDT-M·테이커·30s 폴링)* 에서는 실현 불가. 영구 자산 = 8 전략군 검증 인프라 + BTC risk-off 안전 게이트.
+> 모듈: `strategy/pair_selector.py`(공적분 스캐너), `strategy/pair_stat_arb.py`(시그널 상태머신), `analytics/pair_arb_backtest.py`(R0 러너), `scripts/run_pair_arb_r0.py`(CLI), 단위테스트 61건 추가(전체 573 passed). 이전 CCS-Lite v1.1 모듈도 영구 보존.
+>
+> 🟥 **CCS-Lite v1.1 R0 결과(2026-05-24, run_id `ccs_lite_r0_20260523T163501Z`): FAIL.**
+> 작업본에서 5 모듈(sector_map, loss_cooldown, leverage_flush, ccs_lite, ccs_lite_backtest)
+> 구현 + 단위테스트 83건 추가(전체 512 passed, 회귀 0). R0 자동 러너로 Supabase 데이터
+> 평가 → `backtest_runs` 적재. 사전확정 기준 7개 중 6개 FAIL, 1개 PASS(BTC risk-off
+> sanity, n=0). 핵심 메트릭: STRONG=0, NEUTRAL=0, BLOCKED=0, mean +4h=+0.000%.
+>
+> **FAIL 원인 = 데이터 sparseness**(전략 미스매치 아님): oi_history 가 12 심볼(비보호)
+> × 23일분(2026-04-30~05-23) 뿐. 6-조건 AND base trigger 의 c1(OI ≤ −3%)이 OI 데이터
+> 없는 99%+ 봉에서 NaN→False. 1.98M ohlcv 행은 풍부하나 OI 가 사실상 단기 sample.
+> 진단 결과: OI=-1.5%·vol=2x·price=-1%·no_taker 등 *완화 임계*에서도 12 심볼 총 1 이벤트.
+> v1.1 의 6-조건 자체는 *의도된 보수성*(false event 0 수렴)이며, R0 평가하려면:
+>   - oi_history 2y × ≥30 심볼 backfill (Binance OI hist API 30일 한계 → 외부 데이터
+>     소스 필요 또는 60+ 일 단순 누적 후 점진 평가)
+>   - 또는 c1 임계 사전 *재고정*(데이터 마이닝 위험 — 권장 안 함)
+>
+> **정직 종료 처리(계획서 §FAIL 시 규칙)**: 데이터 충분성 미달도 미달이다. CCS-Full·V3
+> 재시도, c1 임계 완화로의 *골대 옮기기* 모두 금지. 미래 OI 데이터 ≥2y×30 심볼 누적
+> 시점에 동일 사전확정 R0 단일 평가만 허용. 그 전엔 실거래 GO **HOLD** 유지.
+> 영구 자산 = 검증 인프라 + CCS-Lite v1.1 5 모듈 + 단위테스트(재실행 가능).
 
 ## Context
 v3.1.2 봇의 실거래 투입 전 안정화 작업을 다회 세션에 걸쳐 진행 중. 최근 세션에서
