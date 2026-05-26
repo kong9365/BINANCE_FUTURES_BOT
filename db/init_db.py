@@ -1,6 +1,6 @@
 """DB 초기화 — schema.sql 적용 + 마이그레이션 등록.
 
-명세서 §13 + 부록 E-7.
+명세서 §13 + 부록 E-7 + 청사진 §6 (M1 v3.2.0 신규).
 
 실행 순서:
     1. data/ 디렉토리 생성, data/bot.db 연결
@@ -10,6 +10,9 @@
        (ALTER TABLE 포함 — 미등록일 때만 실행하므로 재실행 안전)
     5. schema_migrations 에 'v3.1.2' 미등록 시 v3_1_1_to_v3_1_2.sql 적용
        (trades 거래소 주문 추적 컬럼 — 미등록일 때만 실행)
+    6. schema_migrations 에 'v3.2.0' 미등록 시 v3_1_2_to_v3_2_0.sql 적용
+       (청사진 §6 데이터 모델 — setup_registry, signal_decisions, agent_reviews,
+        audit_log, kill_switch_events + audit_log append-only trigger)
 
 `python db/init_db.py` 로 직접 실행하거나, init_db()/get_applied_versions()
 를 import 해서 사용한다 (테스트 등).
@@ -32,6 +35,7 @@ SCHEMA_PATH = DB_DIR / "schema.sql"
 MIGRATIONS_DIR = DB_DIR / "migrations"
 MIGRATION_V3_1_1 = MIGRATIONS_DIR / "v3_1_to_v3_1_1.sql"
 MIGRATION_V3_1_2 = MIGRATIONS_DIR / "v3_1_1_to_v3_1_2.sql"
+MIGRATION_V3_2_0 = MIGRATIONS_DIR / "v3_1_2_to_v3_2_0.sql"
 
 
 def get_applied_versions(conn: sqlite3.Connection) -> set[str]:
@@ -91,6 +95,15 @@ def init_db(db_path: Path | str = DEFAULT_DB_PATH) -> Path:
             logger.info("[init_db] v3.1.2 마이그레이션 적용")
         else:
             logger.info("[init_db] v3.1.2 이미 적용됨 — 건너뜀")
+
+        # 6. v3.2.0 델타 (청사진 §6: setup_registry, signal_decisions, agent_reviews,
+        #    audit_log + append-only trigger, kill_switch_events — 미등록일 때만)
+        if "v3.2.0" not in applied:
+            _apply_sql_file(conn, MIGRATION_V3_2_0)
+            conn.commit()
+            logger.info("[init_db] v3.2.0 마이그레이션 적용 (청사진 §6 데이터 모델)")
+        else:
+            logger.info("[init_db] v3.2.0 이미 적용됨 — 건너뜀")
 
         final = sorted(get_applied_versions(conn))
         logger.info("[init_db] 완료 — 적용 버전: %s", final)

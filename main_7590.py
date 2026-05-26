@@ -81,6 +81,9 @@ from strategy.breakout import BreakoutConfig, evaluate_breakout
 from strategy.btc_risk_off import (
     BTCRiskOffState, evaluate as btc_risk_off_evaluate, is_halted as btc_is_halted,
 )
+
+# v3.2.0 M1: KillSwitch 어댑터 (governance §3.4.3)
+from governance.kill_switch import KillSwitch
 from strategy.cost_guard import CostGuard
 from strategy.oi_filter import GRADE_C_DANGER, OIFilter
 from strategy.pair_whitelist import PairWhitelist
@@ -639,6 +642,16 @@ class MainBot:
     async def _iter(self) -> None:
         """메인 루프 1회 — Layer 0~6 (§8-8-3 + 부록 E-5-2)."""
         self._loop_count += 1
+
+        # ── v3.2.0 M1: KillSwitch 어댑터 체크 (청사진 §3.4.3) ──
+        # 파일 기반 KILLSWITCH OR btc_risk_off.is_halted() 둘 중 하나라도 활성이면
+        # iteration 차단. btc_risk_off 본문은 0줄 수정 (CLAUDE.md TIER 1 #5).
+        if KillSwitch.is_active(
+            btc_state=self.btc_risk_off_state,
+            now=datetime.now(timezone.utc),
+        ):
+            logger.critical("[Main] KillSwitch 활성 — iteration 차단")
+            return
 
         # ── 데이터 신선도 프라이밍 (Layer 0 이전) ──
         # WS 는 스텁이므로 REST 폴링 성공을 kline 신선도로 인정한다. 이 갱신을
