@@ -427,6 +427,18 @@ RISK_HIERARCHY_CONFIG = _RISK_HIERARCHY_CONFIG
 
 
 # ─────────────────────────────────────────────────────
+# v3.2.0 M7 — Shadow Agent integration (env ENABLE_SHADOW_AGENTS)
+# ENABLE_SHADOW_AGENTS=true 시 main_7590._handle_signal 후 5-Agent review 자동.
+# *shadow 만* — 실거래 결정 영향 X. audit_log 적재만.
+# ─────────────────────────────────────────────────────
+from governance.shadow_config import (  # noqa: E402
+    ShadowAgentConfig as _ShadowAgentConfig,
+)
+ShadowAgentConfig = _ShadowAgentConfig
+SHADOW_AGENT_CONFIG = _ShadowAgentConfig()
+
+
+# ─────────────────────────────────────────────────────
 # Microstructure Universe (Phase 2 — Tiered collection only)
 # ─────────────────────────────────────────────────────
 # *수집* universe 전용. 실거래 universe (PAIR_WHITELIST_CONFIG.protected_symbols 적용)
