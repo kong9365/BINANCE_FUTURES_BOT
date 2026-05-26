@@ -118,7 +118,10 @@ tmp/
 # CLAUDE.md는 공유 — 커밋 OK
 # CLAUDE.local.md는 개인 노트 — 미커밋
 CLAUDE.local.md
-.claude/
+# v3.2.0 M6: .claude/* 자식만 ignore, hooks 는 *공유* (멀티 PC 호환).
+.claude/*
+!.claude/hooks/
+!.claude/hooks/**
 
 # ── OS ──
 .DS_Store

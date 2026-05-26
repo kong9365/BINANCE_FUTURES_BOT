@@ -1,6 +1,36 @@
 # Binance Futures Bot — 세션 연속성 핸드오프 (컨텍스트 초기화 후 재개용)
 
-> 최종 갱신: 2026-05-26 (**v3.2.0 청사진 리팩토링 M0 시작 — 알파 재검토 시나리오**)
+> 최종 갱신: 2026-05-27 (**v3.2.0 청사진 리팩토링 M0~M6 모두 완료 ✅ Phase 1.5 대기**)
+>
+> 🎉 **2026-05-27: v3.2.0 청사진 리팩토링 M0~M6 완료.**
+>
+> commits (refactor/blueprint-m0-foundation 브랜치):
+> - M0 `e795460` 사전 정렬 (CLAUDE.md 4→6 + TIER 1 #9 완화 + SPEC E-10)
+> - M0.5 `dfaf368` 작업본 → GitHub 대량 동기화 (Phase 1~2-E 누적 변경 72파일)
+> - M1 `433be52` ALCOA+ 기반 + KillSwitch 어댑터 (audit/ + governance/ + DB v3.2.0)
+> - M2 `e9293c3` Strategy Skill 3개 + Setup Registry + 7기준 게이트
+> - M3 `9821a96` 5-Agent Subagent 인프라 + RiskManager 7→5 매핑
+> - M4 `37e1c58` KillSwitch 자동 6조건 + Stage 3 + 2-tier hierarchy
+> - M5 `23edbe4` Slack MCP + Binance MCP shadow + Outbox (Notion 보류)
+> - M6 (예정) Hooks (PowerShell) + 종합 검증 + Phase 1.5 안내
+>
+> pytest: 718 (M0 기준선) → 929 (M5 종료) — **211개 신규 단위 테스트, 회귀 0**
+>
+> 청사진 § 매핑 완료도: §3.1 (Binance MCP shadow + WS) / §3.2 (Strategy Skill + 5-Agent + Rotation) /
+> §3.3 (기존 trading/ 0줄 수정, M3 RiskAgent wrap) / §3.4 (KillSwitch 어댑터 + 6조건 + Slack + Hooks) /
+> §6 (SignalDecision + AgentReview + AuditLog chain) / §7 (ALCOA+ 9원칙 + 2-tier hierarchy + Stage 3) / §10.1 (CLAUDE.md)
+>
+> 운영자 5문제 + 9발견 모두 반영. 자세히 [docs/REFACTOR_M6_FINAL_REPORT.md](REFACTOR_M6_FINAL_REPORT.md).
+>
+> **다음 단계 (Phase 1.5)**:
+> 1. 운영자 명시 GO + M2 7기준 백테스트 실행 (DailyTSMOMDonchianSkill)
+> 2. R0_QUALIFIED 후보 결정
+> 3. Phase 1.5 prompt 작성 (별도 세션)
+> 4. $30~50 소액 자본 → 5-Agent 자동 작동 + Slack 알림 + KillSwitch
+>
+> 실거래 GO 여전히 **HOLD**. 인프라 강화 완료, 실거래는 Phase 1.5 별도 진행.
+
+> 옛 갱신: 2026-05-26 (**v3.2.0 청사진 리팩토링 M0 시작 — 알파 재검토 시나리오**)
 > 본 문서는 [docs/REFACTOR_PLAN_v2_BLUEPRINT.md](REFACTOR_PLAN_v2_BLUEPRINT.md) (마일스톤 M0~M6) 의 컨텍스트 진행 기록.
 > 멀티 PC 연속성: 모든 세션 시작 시 `git pull` + 본 문서 + `REFACTOR_M<N>_REPORT.md` 확인 필수.
 > (세션 0~12 구현 완료 시점의 옛 핸드오프는 git 히스토리에 보존됨.)
