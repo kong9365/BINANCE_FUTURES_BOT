@@ -41,6 +41,14 @@ USDT-M Perpetual 선물 단타 자동매매 봇. 자본 $1,000~$10,000 대상. �
 - ★ 자본 조회는 **반드시** `capital_manager.get_snapshot()` 통해서만 (v3.1.1)
 - ★ Binance Spot API 호출 금지 (`get_account`, `get_balance` 등 spot 메서드)
 
+### v3.2.0 M8 — Supabase 폐기 (운영자 결정 2026-05-27)
+
+- **Supabase 폐기, 로컬 sqlite only**.
+- `SUPABASE_ENABLED=false` (기본). `data/persistence.py` 가 자동 outbox 전용 모드.
+- 메인 봇 (main_7590.py) 의 Supabase 의존성 **0** — 영향 없음.
+- legacy scripts/ 의 `migrate_local_cache_to_supabase` 등은 *비활성*. 운영자 명시 GO 시만 사용.
+- HANDOFF.md 의 Phase 2-E 시점의 Supabase migration 은 *과거 기록* (재현 불요).
+
 ### TIER 3 — 절대 금지
 
 - ❌ **GPT 실시간 의사결정 호출** (명세서 §3-1)

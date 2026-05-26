@@ -92,6 +92,15 @@ class SupabasePersistence:
 
     # ── 클라이언트 / outbox 초기화 ──────────────────────────────────────
     def _build_client(self, url: Optional[str], key: Optional[str]):
+        # v3.2.0 M8 (운영자 결정 2026-05-27): Supabase 폐기, 로컬 only.
+        # SUPABASE_ENABLED 기본 false. true 명시 시만 client 생성 시도 (legacy).
+        enabled = os.environ.get("SUPABASE_ENABLED", "false").strip().lower()
+        if enabled not in ("1", "true", "yes", "on"):
+            logger.info(
+                "[Persistence] SUPABASE_ENABLED=false (v3.2.0 M8 운영자 결정) — "
+                "로컬 sqlite outbox 전용 모드"
+            )
+            return None
         url = url or os.environ.get("SUPABASE_URL")
         key = key or os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
         if not url or not key:
