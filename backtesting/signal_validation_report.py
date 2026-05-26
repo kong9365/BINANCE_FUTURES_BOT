@@ -123,7 +123,7 @@ def summarize(report: ValidationReport) -> str:
     """ValidationReport 를 운영자 친화 텍스트로."""
     lines = [
         f"=== 7-Criteria Validation Report (mode={report.mode}) ===",
-        f"Result: {'PASS ✓' if report.passed else 'FAIL ✗'}",
+        f"Result: {'PASS [OK]' if report.passed else 'FAIL [X]'}",
         "",
         "Metrics:",
         f"  n                          = {int(report.metrics.get('n', 0))} "
