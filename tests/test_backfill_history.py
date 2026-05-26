@@ -82,3 +82,34 @@ def test_push_chunked_splits():
     n = bh._push_chunked(persist, "ohlcv", rows, chunk=1000)
     assert n == 2500
     assert persist.upsert_many.call_count == 3      # 1000+1000+500
+
+
+def test_resolve_backfill_symbols_top_n_excludes_protected(monkeypatch):
+    client = MagicMock()
+
+    def _fake_universe(c, exclude=None, top_n=None, min_quote_volume_usd=10_000_000.0):
+        assert exclude is not None
+        assert "BTCUSDT" in exclude
+        return [type("E", (), {"symbol": "SOLUSDT"})()]
+
+    monkeypatch.setattr(
+        "backtesting.universe.resolve_liquid_universe", _fake_universe,
+    )
+    syms = bh.resolve_backfill_symbols(
+        client, symbols_top_n=50, exclude_protected=True, include_index=False,
+    )
+    assert syms == ["SOLUSDT"]
+
+
+def test_resolve_backfill_symbols_adds_index(monkeypatch):
+    client = MagicMock()
+    monkeypatch.setattr(
+        "backtesting.universe.resolve_liquid_universe",
+        lambda c, exclude=None, top_n=None, min_quote_volume_usd=10_000_000.0: [
+            type("E", (), {"symbol": "SOLUSDT"})(),
+        ],
+    )
+    syms = bh.resolve_backfill_symbols(
+        client, symbols_top_n=1, exclude_protected=True, include_index=True,
+    )
+    assert syms == ["SOLUSDT", "BTCUSDT", "ETHUSDT"]

@@ -2,11 +2,10 @@
 # Binance Futures Bot v3.1 — .gitignore
 # =====================================================================
 
-# ── 비밀 / 환경 변수 (절대 커밋 금지) ──
+# ── 비밀 / 환경 변수 (절대 커밋 금지, v3.2.0 강화: 와일드카드) ──
 .env
-.env.local
-.env.production
-.env.*.local
+.env.*
+!.env.example       # 단, 예제 파일은 커밋 허용
 *.key
 *.pem
 secrets/

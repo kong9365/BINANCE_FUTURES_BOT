@@ -1,0 +1,39 @@
+@echo off
+REM ─────────────────────────────────────────────────────────────────────
+REM  Binance WS Microstructure Collector — Windows Scheduled Task wrapper
+REM
+REM  ★ 이 파일은 *템플릿* 입니다. 운영자가 머신 특정 경로로 복사 + 수정 후 사용.
+REM     커밋 금지(.gitignore 에 *.bat 추가 권장).
+REM
+REM  설치 순서:
+REM    1) 이 파일을 C:\bots\BINANCE_FUTURES_BOT\run_ws_collector.bat 으로 복사
+REM       (BinanceOICollect 와 동일 패턴 — OneDrive 외부 경로)
+REM    2) 경로 변수 (PROJECT_DIR, LOG_FILE) 환경에 맞게 수정
+REM    3) Windows Task Scheduler 등록 (관리자 PowerShell):
+REM       $action = New-ScheduledTaskAction -Execute "C:\bots\BINANCE_FUTURES_BOT\run_ws_collector.bat"
+REM       $trigger = New-ScheduledTaskTrigger -AtStartup
+REM       $settings = New-ScheduledTaskSettingsSet `
+REM         -AllowStartIfOnBatteries `
+REM         -DontStopIfGoingOnBatteries `
+REM         -StartWhenAvailable `
+REM         -RestartCount 5 -RestartInterval (New-TimeSpan -Minutes 1) `
+REM         -ExecutionTimeLimit (New-TimeSpan -Days 0)
+REM       Register-ScheduledTask -TaskName "BinanceWSCollect" `
+REM         -Action $action -Trigger $trigger -Settings $settings `
+REM         -RunLevel Highest
+REM    4) 시작: Start-ScheduledTask -TaskName "BinanceWSCollect"
+REM    5) 검증: Get-ScheduledTaskInfo -TaskName "BinanceWSCollect"
+REM ─────────────────────────────────────────────────────────────────────
+
+SET PROJECT_DIR=C:\bots\BINANCE_FUTURES_BOT
+SET LOG_DIR=%PROJECT_DIR%\logs
+SET LOG_FILE=%LOG_DIR%\ws_collector.log
+SET PYTHONPATH=%PROJECT_DIR%
+SET PYTHONIOENCODING=utf-8
+
+REM 로그 디렉토리 보장
+if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
+
+REM 무한 실행 (--top-n 10 거래대금 상위 10 심볼)
+cd /d "%PROJECT_DIR%"
+python scripts\run_ws_collector.py --top-n 10 >> "%LOG_FILE%" 2>&1

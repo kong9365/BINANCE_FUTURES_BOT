@@ -1,0 +1,16 @@
+@echo off
+chcp 65001 >NUL
+REM Microstructure raw data cleanup (TTL DELETE) - BinanceWSCleanup hourly task
+REM Copy to C:\bots\BINANCE_FUTURES_BOT\run_cleanup.bat and register Windows Task hourly.
+SET PROJECT_DIR=C:\bots\BINANCE_FUTURES_BOT
+SET LOG_DIR=%PROJECT_DIR%\logs
+SET LOG_FILE=%LOG_DIR%\ws_cleanup.log
+SET PYTHONPATH=%PROJECT_DIR%
+SET PYTHONIOENCODING=utf-8
+
+if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
+
+cd /d "%PROJECT_DIR%"
+echo [CLEANUP START] %date% %time% >> "%LOG_FILE%"
+python scripts\cleanup_old_data.py --agg-hours 1 --l2-hours 6 >> "%LOG_FILE%" 2>&1
+echo [CLEANUP EXIT %ERRORLEVEL%] %date% %time% >> "%LOG_FILE%"

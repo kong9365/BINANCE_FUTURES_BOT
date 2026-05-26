@@ -367,3 +367,41 @@ backtest_runs 기록). 향후 어떤 가설이든 **동일 사전확정 기준**
 
 > 두 제안 모두 **데이터부터 쌓고(P5a, 즉시) → 게이트는 백테스트로 검증 후 채택(P5b)** 의 순서로,
 > 기존 원칙(검증 안 된 피처를 라이브에 추가 금지, HOLD 유지)을 지킨다.
+
+
+---
+
+## §13. Microstructure Phase 2 — Dynamic Tiered Universe (2026-05-24)
+
+### 이번 변경의 본질
+**이번 변경은 알파 추가가 아니라 *데이터 수집 범위 개선*이다.** 9 전략군 정직 종료
+이후 활성 방향은 "마이크로구조 데이터 우위 확보" 이며, Phase 1 의 Top-10 고정
+universe 가 *수집기 검증용* 으로는 적절했지만 *최종 알파 검증용 universe* 로는
+너무 좁다는 운영자 critique 반영. 알파/IC/R0/ML/진입 로직 일체 변경 없음.
+
+### 변경 사항
+- 신규 모듈: `data/microstructure_universe.py` — Tier 0/1/2/3 분류, crypto-only 필터,
+  commodity-like exact symbol set (XAU/XAG/CL/BZ) 제외, exchangeInfo
+  `PERPETUAL+USDT+TRADING` 통과 강제, lineage snapshot 저장.
+- 신규 Supabase 테이블: `collection_universe_snapshots` (ts, tier, symbol,
+  quote_volume, category, stream_types, source, resolver_version) — Phase 3 IC
+  분석 시 *point-in-time universe* 복원.
+- `data/ws_collector.py`: `symbol_streams` 옵션 추가 (Tier 별 stream 분리), raw
+  `websockets` 단일 multiplex (python-binance 1.0.36 의 depth 누락 버그 회피).
+- `scripts/run_ws_collector.py`: `--tiered-universe`, `--tier1-count`,
+  `--tier2-count`, `--include-commodity-like`, `--print-universe` 옵션.
+
+### 검증
+- 단위테스트 27 추가 (universe 21 + ws_collector 6), 전체 684 passed.
+- 5min smoke (tier1=15/tier2=30, 51 symbols, 73 streams): l2=5,682 / agg=295,280 /
+  reconnects=0 / dedup 0 / avg latency 149ms / commodity-like 0.
+
+### 트레이딩 universe 와의 분리 (절대)
+- collection universe (본 모듈) = BTC/ETH 등 보호종목 *포함 가능* (시장 기준선).
+- trading universe (`PAIR_WHITELIST_CONFIG.protected_symbols`) = 보호종목 *영구 차단*.
+- 두 universe 는 코드/문서/테스트 모두 분리. 실거래 경로(`main_7590._iter`,
+  `executor.py`, `_execute_decision`)는 본 작업서 전혀 미수정.
+
+### 실거래 GO
+**HOLD 무기한 유지**. Phase 3 (60-90일 데이터 누적 후 IC → Rule-based → R0) 까지
+어떠한 진입/주문도 추가 안 함.

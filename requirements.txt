@@ -14,6 +14,9 @@ openai>=1.30.0                # gpt-4o-mini 호출
 pandas>=2.0.0
 numpy>=1.24.0
 pyyaml>=6.0                   # config/macro_events.yaml
+statsmodels>=0.14.0           # analytics/pair_arb_backtest.py — ADF cointegration test
+scikit-learn>=1.4.0           # analytics/ev_model.py — Ridge/ElasticNet baseline + metrics
+lightgbm>=4.0.0               # analytics/ev_model.py — main regressor + early stopping
 
 # ── 기술적 지표 (선택, 직접 구현 권장) ──
 # pandas-ta>=0.3.14b0         # 명세서는 자체 구현 사용. 검증 비교용으로만.

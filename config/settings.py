@@ -414,6 +414,21 @@ BTC_RISK_OFF_CONFIG = BTCRiskOffConfig()
 
 
 # ─────────────────────────────────────────────────────
+# Microstructure Universe (Phase 2 — Tiered collection only)
+# ─────────────────────────────────────────────────────
+# *수집* universe 전용. 실거래 universe (PAIR_WHITELIST_CONFIG.protected_symbols 적용)
+# 와 분리. 자세한 설계: data/microstructure_universe.py 모듈 docstring.
+from data.microstructure_universe import (  # noqa: E402
+    MicrostructureUniverseConfig as _MicrostructureUniverseConfig,
+    MICROSTRUCTURE_UNIVERSE_CONFIG as _MICROSTRUCTURE_UNIVERSE_CONFIG,
+)
+
+# Re-export (config 모듈 통합 import 패턴)
+MicrostructureUniverseConfig = _MicrostructureUniverseConfig
+MICROSTRUCTURE_UNIVERSE_CONFIG = _MICROSTRUCTURE_UNIVERSE_CONFIG
+
+
+# ─────────────────────────────────────────────────────
 # 전략 선택 (P2 — 라이브 활성 매수 전략)
 # ─────────────────────────────────────────────────────
 @dataclass
