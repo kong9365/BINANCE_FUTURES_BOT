@@ -414,6 +414,19 @@ BTC_RISK_OFF_CONFIG = BTCRiskOffConfig()
 
 
 # ─────────────────────────────────────────────────────
+# v3.2.0 M4 — 2-tier risk hierarchy (운영자 결정 #v2-2)
+# 본 import 는 governance.risk_hierarchy 의 정의를 re-export.
+# 다른 *_CONFIG 와 일관성을 위해 settings 에서 노출.
+# ─────────────────────────────────────────────────────
+from governance.risk_hierarchy import (  # noqa: E402
+    RiskHierarchyConfig as _RiskHierarchyConfig,
+    RISK_HIERARCHY_CONFIG as _RISK_HIERARCHY_CONFIG,
+)
+RiskHierarchyConfig = _RiskHierarchyConfig
+RISK_HIERARCHY_CONFIG = _RISK_HIERARCHY_CONFIG
+
+
+# ─────────────────────────────────────────────────────
 # Microstructure Universe (Phase 2 — Tiered collection only)
 # ─────────────────────────────────────────────────────
 # *수집* universe 전용. 실거래 universe (PAIR_WHITELIST_CONFIG.protected_symbols 적용)
