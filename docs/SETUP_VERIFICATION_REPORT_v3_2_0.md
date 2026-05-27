@@ -1,6 +1,6 @@
 # M11 Setup Verification Report (v3.2.0)
 
-> Generated: 2026-05-26T18:54:21.218586+00:00
+> Generated: 2026-05-27T12:53:14.512297+00:00
 > Setup: `1d_tsmom_donchian_long_v1`
 > PARAMS_HASH: `ffbacd920f619e7a4b2d04e9734ce066a7b7ce2070f23e086c271ecdb461caab`
 > Universe: 18 symbols
@@ -18,16 +18,14 @@ Metrics:
   Net PF                     = 1.260 (min 1.25)
   Expectancy_R               = 0.1178 (min 0.0)
   avg_win/avg_loss           = 1.357 (min 1.5)
-  MDD %                      = 204.74% (max 25.0%)
+  MDD %                      = 9.92% (max 25.0%)
   Single Symbol Max %        = 8.07% (max 25.0%)
   Top-3 Excluded PF          = 1.102 (min 1.0)
   Win Rate                   = 48.1%
 
-Failed criteria (2): min_avg_win_loss_ratio, max_mdd_pct
+Failed criteria (1): min_avg_win_loss_ratio
 ```
 
 ## Status
 
-❌ **FAIL** — 2 fails → DISABLED
-
-청사진 §7.5 Stage 3 옵션 A/B/C 회의 권장
+⚠️ **CONDITIONAL** — 1 fail (운영자 명시 결정 필요)

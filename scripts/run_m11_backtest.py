@@ -156,6 +156,10 @@ def run_skill_backtest(
 
     trades = []
     cost_rt_pct = 0.18  # round-trip 비용 (taker + slippage 보수)
+    # 자본 대비 position size (sizing.dynamic_sizer min_size_pct 2% ~ 12% 중간값)
+    # M13 수정: signal_validation MDD 가 자본 대비% 로 계산되므로
+    # pnl_pct 도 자본 대비% 로 변환 (전체 자본 100% 진입 가정 X).
+    position_pct = 5.0  # 자본 5% per trade
 
     for sym in universe:
         all_candles = store.get_candles(sym, interval, limit=10000)
@@ -203,15 +207,17 @@ def run_skill_backtest(
                         break
             if exit_price is None:
                 exit_price = all_candles[min(i + 29, len(all_candles) - 1)][3]
-            # pnl 계산
+            # pnl 계산 (raw — price 변화율)
             if signal.action == "LONG":
-                pnl_pct = (exit_price - entry) / entry * 100 - cost_rt_pct
+                pnl_pct_raw = (exit_price - entry) / entry * 100 - cost_rt_pct
             else:
-                pnl_pct = (entry - exit_price) / entry * 100 - cost_rt_pct
+                pnl_pct_raw = (entry - exit_price) / entry * 100 - cost_rt_pct
             # pnl_r = pnl / atr_stop_mult (1R = ATR × atr_stop_mult)
             atr_pct = signal.atr / entry * 100
             stop_distance_pct = atr_pct * bcfg.atr_stop_mult
-            pnl_r = pnl_pct / stop_distance_pct if stop_distance_pct > 0 else 0
+            pnl_r = pnl_pct_raw / stop_distance_pct if stop_distance_pct > 0 else 0
+            # 자본 대비% (position_pct 적용 — signal_validation MDD 자본대비% 정합)
+            pnl_pct_capital = pnl_pct_raw * position_pct / 100
 
             trades.append({
                 "symbol": sym,
@@ -220,7 +226,7 @@ def run_skill_backtest(
                 "exit_ts": all_candles[min(i + 29, len(all_candles) - 1)][5],
                 "entry": entry,
                 "exit": exit_price,
-                "pnl_pct": pnl_pct,
+                "pnl_pct": pnl_pct_capital,    # 자본 대비% (MDD/single_symbol/top3 계산용)
                 "pnl_r": pnl_r,
                 "is_win": pnl_r > 0,
                 "exit_reason": exit_reason,

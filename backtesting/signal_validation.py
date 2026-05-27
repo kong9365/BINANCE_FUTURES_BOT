@@ -141,17 +141,20 @@ def validate_setup(
     if mode == "mean_rev" and win_rate < th["min_win_rate_mean_rev"]:
         failed.append("min_win_rate_mean_rev")
 
-    # MDD 계산 (equity curve 기반)
-    equity = 0.0
-    peak = 0.0
+    # MDD 계산 (자본 대비% — 복리 모델, M13 수정 2026-05-27)
+    # 이전: cumulative pnl_pct 누적 (자본 대비% 아님 → MDD 200%+ 비현실적)
+    # 수정: capital *= (1 + pnl_pct/100), MDD = (peak - equity) / peak * 100
+    # 가정: risk per trade 일정 % (운영자 risk_per_trade_pct=0.5% 정합)
+    capital = 1.0   # 정규화 자본 (배수)
+    peak = 1.0
     max_dd = 0.0
     for t in trades:
-        equity += t.get("pnl_pct", 0)
-        if equity > peak:
-            peak = equity
-        dd = peak - equity
-        if dd > max_dd:
-            max_dd = dd
+        capital *= (1 + t.get("pnl_pct", 0) / 100.0)
+        if capital > peak:
+            peak = capital
+        dd_pct = (peak - capital) / peak * 100 if peak > 0 else 0.0
+        if dd_pct > max_dd:
+            max_dd = dd_pct
     metrics["mdd_pct"] = max_dd
     if max_dd > th["max_mdd_pct"]:
         failed.append("max_mdd_pct")
