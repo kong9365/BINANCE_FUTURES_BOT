@@ -84,6 +84,9 @@ from strategy.btc_risk_off import (
 
 # v3.2.0 M1: KillSwitch 어댑터 (governance §3.4.3)
 from governance.kill_switch import KillSwitch
+
+# v3.2.0 M14: 5-Agent shadow runner 셋업 헬퍼 (ENABLE_SHADOW_AGENTS env 게이트)
+from governance.shadow_setup import build_shadow_runner_for_main_bot
 from strategy.cost_guard import CostGuard
 from strategy.oi_filter import GRADE_C_DANGER, OIFilter
 from strategy.pair_whitelist import PairWhitelist
@@ -436,9 +439,18 @@ class MainBot:
         self._level_counter = _LevelCounter()
         logging.getLogger().addHandler(self._level_counter)
 
+        # ── v3.2.0 M14: 5-Agent shadow runner (ENABLE_SHADOW_AGENTS env 게이트) ──
+        # env OFF 면 None — _handle_signal 에서 no-op. 실거래 결정에 영향 X.
+        self.shadow_runner = build_shadow_runner_for_main_bot(
+            risk_manager=self.risk_manager,
+            system_health_monitor=self.health,
+            db_path=self.db_path,
+        )
+
         logger.info(
-            "[MainBot] 초기화 완료 (dry_run=%s, db=%s, 보호종목=%s)",
+            "[MainBot] 초기화 완료 (dry_run=%s, db=%s, 보호종목=%s, shadow=%s)",
             dry_run, self.db_path, sorted(self.pair_wl.protected_symbols),
+            "ON" if self.shadow_runner is not None else "OFF",
         )
 
     # =================================================================
@@ -777,6 +789,14 @@ class MainBot:
         """단일 신호 처리 — 페어 → OI 필터 → 품질 → 리스크 → 사이징 →
         CostGuard → 실행 (부록 E-5-2)."""
         symbol = candidate.symbol
+
+        # 0) v3.2.0 M14: 5-Agent shadow review (실거래 결정에 영향 X)
+        # ENABLE_SHADOW_AGENTS=true 일 때만 활성. fail-safe — shadow 실패는 메인 루프 차단 X.
+        if self.shadow_runner is not None and self.shadow_runner.enabled:
+            try:
+                await self.shadow_runner.run_shadow(candidate, capital_snapshot)
+            except Exception as e:  # noqa: BLE001 — shadow fail-soft
+                logger.warning("[Shadow] run_shadow 실패: %s (실거래 영향 X)", e)
 
         # 1) 페어 화이트리스트 (protected_symbols 자동 차단)
         if not self.pair_wl.is_allowed(
