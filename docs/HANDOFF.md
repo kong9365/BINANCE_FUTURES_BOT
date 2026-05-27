@@ -1,6 +1,22 @@
 # Binance Futures Bot — 세션 연속성 핸드오프 (컨텍스트 초기화 후 재개용)
 
-> 최종 갱신: 2026-05-27 (**M0~M12 모두 완료 ✅ — 운영자 결정 대기**)
+> 최종 갱신: 2026-05-27 (**M0~M14 — Paper 운영 1~2주 진입**)
+>
+> 🎯 **M13 v2 결과 (2026-05-27, mainnet 16종목 × 3년 1d)**:
+> - **6/7 통과** (n=216 / PF=1.260 / expR=+0.118 / MDD=9.92% / single=8.07% / top3_excl_PF=1.102)
+> - **1 fail (borderline)**: avg_win/loss=1.357 (target 1.5, -0.143)
+> - setup_registry `1d_tsmom_donchian_long_v1`: **CONDITIONAL 자동**
+> - **MDD 9.92% = HANDOFF A1 신뢰 하네스 8.9% 정합** ✓ — 모델 정확성 확인
+> - **Top-3 excluded PF 1.102** = HANDOFF A2-② ZEC 단일종목 행운 *회피 확인*
+> - **HANDOFF 2026-05-23 "알파 영구 중단" 재검토 결과: CONDITIONAL** (DISABLED 아님)
+>
+> 🚀 **M14 (2026-05-27) — Paper 운영 1~2주 시작**: 운영자 명시 결정.
+> - **[docs/PAPER_OPERATION_GUIDE.md](PAPER_OPERATION_GUIDE.md)** 절차 따라 진행
+> - testnet 1~2주 dry-run + 대시보드 (localhost:8501) 모니터링
+> - 종료 시 운영자 명시 GO → Phase 1.5 micro-live 진입
+> - 또는 비정상 종료 시 추가 Paper / Stage 3 결정
+
+> 옛 갱신: 2026-05-27 (M0~M12 모두 완료 ✅ — 운영자 결정 대기)
 >
 > 🎯 **M12 결과 (2026-05-27): DailyTSMOMDonchianSkill testnet 1년 1d 실측 = FAIL (6/7).**
 >

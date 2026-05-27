@@ -26,7 +26,9 @@ USDT-M Perpetual 선물 단타 자동매매 봇. 자본 $1,000~$10,000 대상. �
 6. ★ **보호 자산 절대 룰** (v3.1.1 + 청사진 §10.1 #2): protected_symbols (**BTCUSDT/ETHUSDT/HOLOUSDT/CFXUSDT/LYNUSDT/INJUSDT** — 6개) 는 봇이 거래 못함. 명시적 차단 룰 절대 우회 금지.
 7. ★ **9개 실패 strategy 재시도 금지** (청사진 §10.1 #9 + M11 실측 2026-05-27): OI-급증, 돌파 1h, 펀딩 페이드, ORB, CSM, LCR, CCS-Lite, ML EV, Pair stat-arb.
 
-   **M11 testnet smoke (2026-05-27)**: 1년 1d × 3종목 → trades=4 (표본 부족) → 6/7 FAIL → **DISABLED 자동**. 데이터 확장 후 재실행 필요 (운영자 결정 대기 — M12 보고서 §3 옵션 A/B/C).
+   **M11 testnet smoke (2026-05-27)**: 1년 1d × 3종목 → trades=4 (표본 부족) → 6/7 FAIL → **DISABLED 자동**.
+
+   **M13 v2 mainnet 실측 (2026-05-27, 옵션 A)**: 16종목 × 3년 1d → trades=216 → **6/7 통과 → CONDITIONAL 자동**. avg_win/loss=1.357 (target 1.5, -0.143 borderline) 단일 fail. MDD=9.92% (HANDOFF A1 신뢰 하네스 8.9% 정합). top3_excluded_pf=1.102 (ZEC 단일 행운 회피 확인). → **HANDOFF "알파 영구 중단" 결정 재검토 결과: CONDITIONAL**. M14 Paper 운영 1~2주 진입 ([docs/PAPER_OPERATION_GUIDE.md](docs/PAPER_OPERATION_GUIDE.md)).
    - **조건부 완화 (2026-05-26 운영자 명시 GO)**: 1d 돌파/Donchian 의 *완전 재검증*은 운영자 권장 **7기준** (n≥200 / Net PF≥1.25 / Expectancy_R>0 / avg_win/avg_loss≥1.5 / MDD≤25% / single_symbol<25% / **상위 3종목 제거 PF≥1.0**) 통과 시 R0_QUALIFIED 허용. 단순 재시도(같은 데이터 + 같은 임계)는 여전히 금지.
    - top3_excluded_pf 기준은 2026-05-22 A2-② 발견 (top8 PF 2.20 → ZEC 단일 97% 기여 → 사실 PF≈1.0) 의 재발 방지.
 8. ★ **GitHub 중심 워크플로우** (운영자 결정 2026-05-26): 매 세션 시작 `git pull` + `docs/HANDOFF.md` + `docs/REFACTOR_M<N-1>_REPORT.md` 확인. 종료 시 `pytest` + `REFACTOR_M<N>_REPORT.md` + `HANDOFF.md` 갱신 + 명시 add + commit + push.
