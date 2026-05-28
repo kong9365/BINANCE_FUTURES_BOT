@@ -1,6 +1,22 @@
 # Binance Futures Bot — 세션 연속성 핸드오프 (컨텍스트 초기화 후 재개용)
 
-> 최종 갱신: 2026-05-27 (**M0~M14 — Paper 운영 1~2주 진입**)
+> 최종 갱신: 2026-05-28 (**M15 — 라이브 1d DailyTSMOM + shadow 공유게이트 통합**)
+>
+> 🔧 **M15 (2026-05-28)**: Paper 1차 가동(11.5h) 분석 중 *3개 구조적 단절* 발견 → 수정.
+> - **단절1**: 라이브 루프에 1d 전략 부재 (oi_surge/breakout 1h 둘 다 실패전략). DailyTSMOM 라이브 미연결
+> - **단절2**: shadow 가 oi_surge 경로(`_handle_signal`)에만 연결 — breakout 우회
+> - **단절3**: shadow setup_id 하드코딩 (모든 candidate 1d_tsmom 오라벨)
+> - **수정**: 신규 `_scan_daily_tsmom` 분기 + shadow `_execute_decision`(공유게이트, 게이트 앞)로 이동 +
+>   `run_shadow_for_decision` (실제 setup_id 보존) + setup_registry M13 v2 실측 갱신(CONDITIONAL)
+> - **검증**: pytest **1011 통과** (+22, 회귀 0). E2E smoke: 1 SIGNAL_GENERATED + 5 AGENT_REVIEW + 1 SIGNAL_REVIEWED (APPROVED, 라벨 정합)
+> - **운영자 재가동**: `.env` 에 `ACTIVE_STRATEGY=daily_tsmom` 추가 필수 → `python main_7590.py --dry-run --duration 1209600`
+> - 자세히: [docs/REFACTOR_M15_REPORT.md](REFACTOR_M15_REPORT.md)
+> - **M16 후보**: orchestrator 가 `agent_reviews` 테이블 미적재 (audit_log 에는 적재됨) → 대시보드 page2 빈 것처럼 보임
+>
+> ⚠️ **Windows 예약작업 4개 비활성화 (2026-05-28)**: BinanceOICollect/WSCleanup/WSCollect/WSHealthDaily
+> (Phase 2-E 데이터 수집 데몬, testnet Paper 에 불필요) → `Disable-ScheduledTask`. Phase 2 시 `Enable-ScheduledTask` 재활성화.
+
+> 옛 갱신: 2026-05-27 (**M0~M14 — Paper 운영 1~2주 진입**)
 >
 > 🎯 **M13 v2 결과 (2026-05-27, mainnet 16종목 × 3년 1d)**:
 > - **6/7 통과** (n=216 / PF=1.260 / expR=+0.118 / MDD=9.92% / single=8.07% / top3_excl_PF=1.102)

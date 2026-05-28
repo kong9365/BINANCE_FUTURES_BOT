@@ -159,3 +159,118 @@ def test_config_exported_from_settings():
     """config/settings.py 에서 re-export."""
     from config.settings import SHADOW_AGENT_CONFIG, ShadowAgentConfig
     assert isinstance(SHADOW_AGENT_CONFIG, ShadowAgentConfig)
+
+
+# ─────────────────────────────────────────────────────
+# M15 — run_shadow_for_decision + setup_id 라벨 정합
+# ─────────────────────────────────────────────────────
+def _make_decision(setup_id="1d_tsmom_donchian_long_v1", symbol="ETHUSDT", action="LONG"):
+    """skill 이 생산하는 형태의 SignalDecision."""
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    return SignalDecision(
+        signal_id="sig-m15-test",
+        setup_id=setup_id,
+        params_hash="ffbacd920f61",
+        signal_source="strategy_skill",
+        reasoning="1d LONG breakout test",
+        ts_signal_generated=now,
+        raw_data_hash="rawhash123",
+        features_snapshot_json='{"action": "LONG", "adx": 30.0}',
+        symbol=symbol,
+        action=action,
+        confidence=0.7,
+        expires_at=now + timedelta(hours=24),
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_shadow_default_setup_id_not_hardcoded_1d(mock_orchestrator, monkeypatch):
+    """M15: run_shadow 기본 setup_id 가 더 이상 1d_tsmom 하드코딩이 아님."""
+    monkeypatch.setenv("ENABLE_SHADOW_AGENTS", "true")
+    captured = {}
+
+    async def _capture(decision):
+        captured["setup_id"] = decision.setup_id
+        return OrchestratorResult(approved=True, final_verdict="APPROVED", reviews=[])
+
+    mock_orchestrator.review_signal = AsyncMock(side_effect=_capture)
+    runner = ShadowAgentRunner(orchestrator=mock_orchestrator)
+    # setup_id 미지정 → 기본 "shadow_unknown" (1d_tsmom 아님)
+    await runner.run_shadow(FakeCandidate())
+    assert captured["setup_id"] == "shadow_unknown"
+    assert captured["setup_id"] != "1d_tsmom_donchian_long_v1"
+
+
+@pytest.mark.asyncio
+async def test_run_shadow_uses_passed_setup_tag(mock_orchestrator, monkeypatch):
+    """M15: run_shadow 가 전달된 setup_tag 로 라벨 (oi_surge/breakout 정합)."""
+    monkeypatch.setenv("ENABLE_SHADOW_AGENTS", "true")
+    captured = {}
+
+    async def _capture(decision):
+        captured["setup_id"] = decision.setup_id
+        return OrchestratorResult(approved=True, final_verdict="APPROVED", reviews=[])
+
+    mock_orchestrator.review_signal = AsyncMock(side_effect=_capture)
+    runner = ShadowAgentRunner(orchestrator=mock_orchestrator)
+    await runner.run_shadow(FakeCandidate(), setup_id="oi_surge_long")
+    assert captured["setup_id"] == "oi_surge_long"
+
+
+@pytest.mark.asyncio
+async def test_run_shadow_for_decision_preserves_setup_id(mock_orchestrator, monkeypatch):
+    """M15: run_shadow_for_decision 은 decision 의 실제 setup_id 보존 (변환 X)."""
+    monkeypatch.setenv("ENABLE_SHADOW_AGENTS", "true")
+    runner = ShadowAgentRunner(orchestrator=mock_orchestrator)
+    decision = _make_decision(setup_id="1d_tsmom_donchian_long_v1")
+    result = await runner.run_shadow_for_decision(decision)
+    assert result is not None
+    # orchestrator 가 *바로 그 decision* 으로 호출됨 (재생성 X)
+    mock_orchestrator.review_signal.assert_called_once_with(decision)
+
+
+@pytest.mark.asyncio
+async def test_run_shadow_for_decision_disabled_noop(mock_orchestrator, monkeypatch):
+    """env OFF → run_shadow_for_decision 즉시 None."""
+    monkeypatch.delenv("ENABLE_SHADOW_AGENTS", raising=False)
+    runner = ShadowAgentRunner(
+        orchestrator=mock_orchestrator, cfg=ShadowAgentConfig(enabled=False),
+    )
+    result = await runner.run_shadow_for_decision(_make_decision())
+    assert result is None
+    mock_orchestrator.review_signal.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_shadow_for_decision_none_safe(mock_orchestrator, monkeypatch):
+    """decision=None → fail-safe None (예외 X)."""
+    monkeypatch.setenv("ENABLE_SHADOW_AGENTS", "true")
+    runner = ShadowAgentRunner(orchestrator=mock_orchestrator)
+    result = await runner.run_shadow_for_decision(None)
+    assert result is None
+    mock_orchestrator.review_signal.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_shadow_for_decision_audit_real_setup_id(
+    mock_orchestrator, monkeypatch, tmp_db
+):
+    """M15: audit_log SIGNAL_GENERATED 가 실제 setup_id 기록 (Disconnect 3 해소)."""
+    monkeypatch.setenv("ENABLE_SHADOW_AGENTS", "true")
+    audit_logger = AuditLogger(db_path=tmp_db)
+    runner = ShadowAgentRunner(orchestrator=mock_orchestrator, audit_logger=audit_logger)
+    await runner.run_shadow_for_decision(
+        _make_decision(setup_id="1d_tsmom_donchian_long_v1")
+    )
+    conn = sqlite3.connect(tmp_db)
+    try:
+        row = conn.execute(
+            "SELECT related_setup_id FROM audit_log "
+            "WHERE event_type = 'SIGNAL_GENERATED'"
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "1d_tsmom_donchian_long_v1"
+    finally:
+        conn.close()

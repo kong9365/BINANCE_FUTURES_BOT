@@ -71,15 +71,19 @@ class ShadowAgentRunner:
         self,
         candidate: Any,
         capital_snapshot: Optional[Any] = None,
-        setup_id: str = "1d_tsmom_donchian_long_v1",
+        setup_id: str = "shadow_unknown",
         params_hash: str = "",
     ) -> Optional[OrchestratorResult]:
         """candidate → SignalDecision 변환 + orchestrator review.
 
+        oi_surge / breakout 처럼 SignalDecision 을 직접 만들지 않는 신호원용.
+        DailyTSMOMDonchianSkill 같이 SignalDecision 을 생산하는 경로는
+        run_shadow_for_decision() 을 쓴다 (변환·라벨 오류 없음).
+
         Args:
             candidate: main_7590 의 candidate object (symbol, action 등 속성).
             capital_snapshot: CapitalSnapshot (선택, audit 메타).
-            setup_id: skill SETUP_ID (기본 DailyTSMOM).
+            setup_id: 실제 신호원 setup_tag (M15: 하드코딩 1d_tsmom 제거 — 라벨 정합).
             params_hash: skill PARAMS_HASH.
 
         Returns:
@@ -138,6 +142,74 @@ class ShadowAgentRunner:
         logger.info(
             "[Shadow] %s review=%s blocked_at=%s",
             decision.symbol, result.final_verdict, result.blocked_at_agent,
+        )
+        return result
+
+    async def run_shadow_for_decision(
+        self,
+        decision: "SignalDecision",
+        capital_snapshot: Optional[Any] = None,
+    ) -> Optional[OrchestratorResult]:
+        """이미 만들어진 SignalDecision 을 그대로 5-Agent review (M15).
+
+        DailyTSMOMDonchianSkill.evaluate() 처럼 SignalDecision 을 직접 생산하는
+        신호원용. candidate→SignalDecision 변환 단계를 건너뛰므로 setup_id /
+        params_hash 라벨이 신호원의 실제 값으로 보존된다 (하드코딩 X).
+
+        Args:
+            decision: skill 이 생산한 SignalDecision (setup_id, params_hash 포함).
+            capital_snapshot: CapitalSnapshot (선택, audit 메타).
+
+        Returns:
+            OrchestratorResult — shadow 만, 실거래 영향 X.
+        """
+        if not self.enabled:
+            return None
+        if decision is None:
+            return None
+
+        # SIGNAL_GENERATED 이벤트 기록
+        if self.cfg.log_to_audit and self.audit_logger:
+            try:
+                await self.audit_logger.log_event(
+                    event_type=EventType.SIGNAL_GENERATED,
+                    payload=decision.to_audit_payload(),
+                    actor="shadow_strategy_skill",
+                    related_signal_id=decision.signal_id,
+                    related_setup_id=decision.setup_id,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[Shadow] audit SIGNAL_GENERATED 실패: %s", e)
+
+        # 5-Agent orchestrator review
+        try:
+            result = await self.orchestrator.review_signal(decision)
+        except Exception as e:  # noqa: BLE001 — shadow 는 fail-safe
+            logger.warning("[Shadow] orchestrator review 실패: %s", e)
+            return None
+
+        # SIGNAL_REVIEWED 이벤트 (요약)
+        if self.cfg.log_to_audit and self.audit_logger:
+            try:
+                await self.audit_logger.log_event(
+                    event_type=EventType.SIGNAL_REVIEWED,
+                    payload={
+                        "signal_id": decision.signal_id,
+                        "approved": result.approved,
+                        "final_verdict": result.final_verdict,
+                        "blocked_at_agent": result.blocked_at_agent,
+                        "n_reviews": len(result.reviews),
+                    },
+                    actor="shadow_orchestrator",
+                    related_signal_id=decision.signal_id,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[Shadow] audit SIGNAL_REVIEWED 실패: %s", e)
+
+        logger.info(
+            "[Shadow] %s (%s) review=%s blocked_at=%s",
+            decision.symbol, decision.setup_id,
+            result.final_verdict, result.blocked_at_agent,
         )
         return result
 

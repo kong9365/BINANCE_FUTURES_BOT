@@ -466,7 +466,7 @@ class StrategyConfig:
     CostGuard/사이징/Executor)는 두 전략이 동일하게 통과한다.
     """
 
-    active_strategy: str = "oi_surge"   # "oi_surge" | "breakout"
+    active_strategy: str = "oi_surge"   # "oi_surge" | "breakout" | "daily_tsmom"
     breakout_interval: str = "1h"
     breakout_limit: int = 250           # ema200 + 여유(형성중 캔들 1개 제외 포함)
     breakout_donchian: int = 20
@@ -474,13 +474,17 @@ class StrategyConfig:
     breakout_ema: int = 200
     breakout_atr_stop: float = 2.0
     breakout_atr_target: float = 4.0
+    # v3.2.0 M15: DailyTSMOMDonchianSkill 라이브 (1d 추세추종, 6/7 CONDITIONAL).
+    #   breakout(1h)과 구분 — skill.evaluate() 가 SignalDecision 생산 + registry 연결.
+    daily_tsmom_interval: str = "1d"
+    daily_tsmom_limit: int = 250        # ema200(min_bars=200) + 형성중 1개 제외 여유
 
 
 def _resolve_active_strategy() -> str:
     """환경변수 ACTIVE_STRATEGY override (유효값만, 그 외 기본 oi_surge)."""
     import os
     v = (os.environ.get("ACTIVE_STRATEGY") or "").strip().lower()
-    return v if v in ("oi_surge", "breakout") else "oi_surge"
+    return v if v in ("oi_surge", "breakout", "daily_tsmom") else "oi_surge"
 
 
 STRATEGY_CONFIG = StrategyConfig(active_strategy=_resolve_active_strategy())

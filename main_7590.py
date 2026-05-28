@@ -87,6 +87,9 @@ from governance.kill_switch import KillSwitch
 
 # v3.2.0 M14: 5-Agent shadow runner 셋업 헬퍼 (ENABLE_SHADOW_AGENTS env 게이트)
 from governance.shadow_setup import build_shadow_runner_for_main_bot
+
+# v3.2.0 M15: DailyTSMOM 1d 라이브 전략 (skill.evaluate → SignalDecision)
+from skills.daily_tsmom_donchian_skill import DailyTSMOMDonchianSkill
 from strategy.cost_guard import CostGuard
 from strategy.oi_filter import GRADE_C_DANGER, OIFilter
 from strategy.pair_whitelist import PairWhitelist
@@ -305,6 +308,8 @@ class MainBot:
             atr_stop_mult=STRATEGY_CONFIG.breakout_atr_stop,
             atr_target_mult=STRATEGY_CONFIG.breakout_atr_target,
         )
+        # v3.2.0 M15: DailyTSMOM 1d skill 인스턴스 (stateless 신호원, registry 연결)
+        self.daily_tsmom_skill = DailyTSMOMDonchianSkill()
 
         # ── 전략 / 사이징 ──
         self.regime_detector = RegimeDetector(
@@ -771,6 +776,9 @@ class MainBot:
         self._scan_count += 1
         if self.active_strategy == "breakout":
             await self._scan_breakout(active_pairs, regime_state, capital_snapshot)
+        elif self.active_strategy == "daily_tsmom":
+            # v3.2.0 M15: 1d 추세추종 (DailyTSMOMDonchianSkill, 6/7 CONDITIONAL)
+            await self._scan_daily_tsmom(active_pairs, regime_state, capital_snapshot)
         else:
             candidates = await self.oi_scanner.scan(active_pairs)
             self._last_candidate_count = len(candidates)
@@ -790,13 +798,8 @@ class MainBot:
         CostGuard → 실행 (부록 E-5-2)."""
         symbol = candidate.symbol
 
-        # 0) v3.2.0 M14: 5-Agent shadow review (실거래 결정에 영향 X)
-        # ENABLE_SHADOW_AGENTS=true 일 때만 활성. fail-safe — shadow 실패는 메인 루프 차단 X.
-        if self.shadow_runner is not None and self.shadow_runner.enabled:
-            try:
-                await self.shadow_runner.run_shadow(candidate, capital_snapshot)
-            except Exception as e:  # noqa: BLE001 — shadow fail-soft
-                logger.warning("[Shadow] run_shadow 실패: %s (실거래 영향 X)", e)
+        # NOTE(M15): 5-Agent shadow 는 _execute_decision(공유 게이트)로 이동.
+        # oi_surge/breakout/daily_tsmom 모두 단일 지점에서 리뷰 → 중복/누락 방지.
 
         # 1) 페어 화이트리스트 (protected_symbols 자동 차단)
         if not self.pair_wl.is_allowed(
@@ -850,13 +853,36 @@ class MainBot:
         regime_state,
         capital_snapshot,
         candidate=None,
+        decision=None,
     ) -> None:
-        """공유 다운스트림 게이트 — oi_surge / breakout 공통 (부록 E-5-2 단계 4~7).
+        """공유 다운스트림 게이트 — oi_surge / breakout / daily_tsmom 공통 (부록 E-5-2 단계 4~7).
 
         신호원이 결정한 action/entry/tp/sl/setup_tag 를 받아 동일한 게이트(리스크→
-        사이징→CostGuard→실행)로 처리한다. 두 전략의 게이트 동작이 갈라지지 않도록
-        단일 소스로 유지한다. candidate 는 shadow 차단 기록용(없으면 생략).
+        사이징→CostGuard→실행)로 처리한다. 세 전략의 게이트 동작이 갈라지지 않도록
+        단일 소스로 유지한다. candidate 는 (레거시) shadow 차단 기록용(없으면 생략).
+        decision 은 skill 이 생산한 SignalDecision (daily_tsmom) — 5-Agent shadow 전달용.
         """
+        # v3.2.0 M15: 5-Agent shadow review — 모든 신호원 공통 단일 지점.
+        # 게이트(리스크/사이징/CostGuard) *앞* 에서 모든 신호 리뷰 (운영자 결정 O2).
+        # 실거래 결정에 영향 X — fail-safe (shadow 예외는 메인 루프 차단 안 함).
+        if self.shadow_runner is not None and self.shadow_runner.enabled:
+            try:
+                if decision is not None:
+                    await self.shadow_runner.run_shadow_for_decision(
+                        decision, capital_snapshot,
+                    )
+                else:
+                    shadow_candidate = candidate if candidate is not None else {
+                        "symbol": symbol, "action": action,
+                    }
+                    await self.shadow_runner.run_shadow(
+                        shadow_candidate, capital_snapshot, setup_id=setup_tag,
+                    )
+            except Exception as e:  # noqa: BLE001 — shadow fail-soft
+                logger.warning(
+                    "[Shadow] _execute_decision shadow 실패: %s (실거래 영향 X)", e
+                )
+
         params = REGIME_TRADING_PARAMS[regime_state.regime]
 
         # 4) 리스크 한도 (capital_manager 자동 조회)
@@ -1032,6 +1058,71 @@ class MainBot:
                 regime_state=regime_state,
                 capital_snapshot=capital_snapshot,
                 candidate=None,
+            )
+
+    async def _scan_daily_tsmom(
+        self, active_pairs, regime_state, capital_snapshot
+    ) -> None:
+        """1d DailyTSMOM 라이브 스캔 (M15) — DailyTSMOMDonchianSkill.evaluate 신호원.
+
+        breakout(1h)과 달리 skill 이 SignalDecision 을 직접 생산 → setup_registry
+        연결 + 5-Agent shadow 가 실제 setup_id(1d_tsmom_donchian_long_v1)로 리뷰한다.
+        룩어헤드 차단: 형성중 마지막 캔들 제외(closed=candles[:-1]) 후 skill 평가,
+        진입가는 현재가(형성중 종가). 보호종목/화이트리스트는 is_allowed 가 차단하고
+        이후 게이트(리스크→사이징→CostGuard→실행)는 _execute_decision 공유.
+        """
+        self._last_candidate_count = 0
+        params = DailyTSMOMDonchianSkill.PARAMS
+        for symbol in active_pairs:
+            if not self.pair_wl.is_allowed(
+                symbol,
+                capital=capital_snapshot.wallet_balance,
+                regime=regime_state.regime,
+            ):
+                continue
+            candles = await self.collector.get_candles(
+                symbol,
+                STRATEGY_CONFIG.daily_tsmom_interval,
+                STRATEGY_CONFIG.daily_tsmom_limit,
+            )
+            if not candles or len(candles) < 2:
+                continue
+            closed = candles[:-1]   # 형성중 마지막 캔들 제외(룩어헤드 차단)
+            decision = self.daily_tsmom_skill.evaluate(
+                symbol, closed, market_state={"regime": str(regime_state.regime)},
+            )
+            if decision.action not in ("LONG", "SHORT"):
+                continue   # FLAT — 진입 조건 미충족
+            try:
+                feats = json.loads(decision.features_snapshot_json)
+            except (ValueError, TypeError):
+                continue
+            atr_val = float(feats.get("atr", 0.0))
+            entry_price = float(candles[-1][3])   # 현재가(형성중 종가)
+            if entry_price <= 0 or atr_val <= 0:
+                continue
+            self._last_candidate_count += 1
+            self._candidate_total += 1
+            if decision.action == "LONG":
+                tp = entry_price + params["atr_target_mult"] * atr_val
+                sl = entry_price - params["atr_stop_mult"] * atr_val
+            else:
+                tp = entry_price - params["atr_target_mult"] * atr_val
+                sl = entry_price + params["atr_stop_mult"] * atr_val
+            if sl <= 0 or tp <= 0:
+                continue
+            await self._execute_decision(
+                symbol=symbol,
+                action=decision.action,
+                entry_price=entry_price,
+                tp=tp,
+                sl=sl,
+                setup_tag=decision.setup_id,
+                score=int(feats.get("adx", 0.0)),
+                regime_state=regime_state,
+                capital_snapshot=capital_snapshot,
+                candidate=None,
+                decision=decision,
             )
 
     # =================================================================

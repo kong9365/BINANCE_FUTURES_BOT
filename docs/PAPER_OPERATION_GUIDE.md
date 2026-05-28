@@ -11,11 +11,19 @@
 ### 1-1. `.env` 확인 + 옵션 설정
 ```bash
 USE_TESTNET=true                          # 안전 (Paper 운영 = testnet)
+ACTIVE_STRATEGY=daily_tsmom               # ★ M15: 1d DailyTSMOM 라이브 (검증 대상 전략)
 ENABLE_SHADOW_AGENTS=true                 # M7 shadow_runner 활성화 (5-Agent 자동 review)
 ENABLE_BINANCE_MCP_SHADOW=false           # 선택 — M5 MCP shadow diff 검증
 KILLSWITCH_FILE=data/KILLSWITCH           # 또는 외장 SSD 경로
 SUPABASE_ENABLED=false                    # 로컬 sqlite only
 ```
+
+> **★ M15 중요 (2026-05-28)**: `ACTIVE_STRATEGY=daily_tsmom` 미설정 시 기본값 `oi_surge`
+> (9개 실패 전략 중 하나) 로 동작하며, 검증 대상인 1d DailyTSMOM 은 *라이브에서 실행되지
+> 않는다*. Paper 운영 목적(DailyTSMOM 6/7 CONDITIONAL 의 5-Agent shadow 검증)을 위해
+> **반드시 `ACTIVE_STRATEGY=daily_tsmom` 설정**. 1d 봉 마감(UTC 00:00) 시점에만 신호가
+> 평가되므로 후보 발생은 드물다(정상). 신호 발생 시 audit_log 에 1 SIGNAL_GENERATED +
+> 5 AGENT_REVIEW + 1 SIGNAL_REVIEWED 가 적재된다.
 
 ### 1-2. 봇 가동 (백그라운드 또는 Windows Task)
 ```bash

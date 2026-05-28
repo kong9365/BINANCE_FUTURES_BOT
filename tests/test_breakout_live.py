@@ -108,6 +108,26 @@ def test_default_active_strategy_is_oi_surge(db_path, monkeypatch):
     assert bot.active_strategy == "oi_surge"      # 기존 동작 불변
 
 
+def test_resolve_active_strategy_daily_tsmom(monkeypatch):
+    """M15: ACTIVE_STRATEGY=daily_tsmom 가 화이트리스트에 추가됨 (oi_surge 폴백 아님)."""
+    from config.settings import _resolve_active_strategy
+
+    monkeypatch.setenv("ACTIVE_STRATEGY", "daily_tsmom")
+    assert _resolve_active_strategy() == "daily_tsmom"
+    monkeypatch.setenv("ACTIVE_STRATEGY", "breakout")
+    assert _resolve_active_strategy() == "breakout"
+    monkeypatch.setenv("ACTIVE_STRATEGY", "bogus_strategy")
+    assert _resolve_active_strategy() == "oi_surge"      # 무효값 → 안전 폴백
+
+
+def test_daily_tsmom_config_fields():
+    """M15: StrategyConfig 에 daily_tsmom_interval/limit 추가."""
+    from config.settings import STRATEGY_CONFIG
+
+    assert STRATEGY_CONFIG.daily_tsmom_interval == "1d"
+    assert STRATEGY_CONFIG.daily_tsmom_limit >= 201      # ema200 + 형성중 1개 여유
+
+
 async def test_breakout_long_enters_and_records(db_path):
     bot = _make_bot(db_path, candles=_uptrend_candles())
     await bot._scan_breakout(["SOLUSDT"], _regime(), _snapshot())
