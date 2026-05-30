@@ -231,7 +231,10 @@ class ExpectancyAnalyzer:
             "SELECT action, entry_price, exit_price, stop_loss, "
             "       COALESCE(pnl_usd_net, pnl_usd, 0), setup_tag, regime "
             "FROM trades "
-            "WHERE timestamp >= ? AND exit_price IS NOT NULL"
+            "WHERE timestamp >= ? AND exit_price IS NOT NULL "
+            # A4b: 합성 청산(_stop_fallback)은 실제 손익이 아니므로 win-rate/
+            # expectancy/avg_R 집계에서 제외(보수적 손실을 엣지 통계에 섞지 않음).
+            "AND (exit_reason IS NULL OR exit_reason NOT LIKE '%stop_fallback%')"
         )
         params: tuple = (since,)
         if setup_tag is not None:

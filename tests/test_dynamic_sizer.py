@@ -180,3 +180,102 @@ def test_scenario_7_capital_20000_ranging_caps():
     assert result.size_pct == pytest.approx(6.0, abs=1e-6)
     assert result.size_usdt == pytest.approx(1200.0, abs=1e-6)
     assert "cap 적용" in result.reason
+
+
+# =====================================================================
+# A1 [2.2] — risk-per-trade 기반 notional cap (손절거리 반영, min 결합)
+# 불변식: 산출 notional 의 손절 손실(qty×|entry−sl|)이 risk_pct×capital 을
+#         절대 초과하지 않는다. 사이즈는 기존 cap 대비 줄어들기만 한다.
+# =====================================================================
+
+
+def _loss_at_stop(size_usdt: float, entry: float, sl: float) -> float:
+    """포지션을 손절가에 청산했을 때의 손실(USDT) = qty × |entry−sl|."""
+    qty = size_usdt / entry
+    return qty * abs(entry - sl)
+
+
+def test_a1_risk_cap_binds_and_caps_loss_to_half_pct():
+    """손절거리가 넓어 risk-cap 이 binding → notional 이 0.5% 룰로 축소."""
+    sizer = DynamicPositionSizer()
+    # baseline(시나리오 2 동일): size_usdt = 500 (10% of 5000)
+    # entry=100, sl=90 (10% 손절거리) → risk_cap = 0.005×5000×100/10 = $250
+    result = sizer.calculate(
+        capital=5000, win_rate=0.60, avg_win_R=2.0, avg_loss_R=1.0,
+        regime="TREND_UP", confidence=0.8, sample_count=30,
+        entry_price=100.0, stop_loss=90.0, risk_per_trade_pct=0.005,
+    )
+    assert result.size_usdt == pytest.approx(250.0, abs=1e-6)   # 500 → 250 (risk cap)
+    assert _loss_at_stop(result.size_usdt, 100.0, 90.0) == pytest.approx(25.0, abs=1e-6)
+    assert _loss_at_stop(result.size_usdt, 100.0, 90.0) <= 0.005 * 5000 + 1e-9
+    assert "risk cap" in result.reason
+
+
+def test_a1_risk_cap_not_binding_leaves_size_unchanged():
+    """손절거리가 좁아 risk-cap > baseline → 사이즈 불변(cap 은 줄이기만)."""
+    sizer = DynamicPositionSizer()
+    # entry=100, sl=99.9 (0.1% 손절거리) → risk_cap = 0.005×5000×100/0.1 = $25,000 ≫ 500
+    result = sizer.calculate(
+        capital=5000, win_rate=0.60, avg_win_R=2.0, avg_loss_R=1.0,
+        regime="TREND_UP", confidence=0.8, sample_count=30,
+        entry_price=100.0, stop_loss=99.9, risk_per_trade_pct=0.005,
+    )
+    assert result.size_usdt == pytest.approx(500.0, abs=1e-6)   # 불변
+    assert "risk cap" not in result.reason
+
+
+def test_a1_risk_cap_can_go_below_min_size_floor():
+    """손절거리가 매우 넓으면 risk-cap 이 min_size(2%) 아래로도 내려간다(리스크 우선)."""
+    sizer = DynamicPositionSizer()
+    # entry=100, sl=70 (30% 손절거리) → risk_cap = 0.005×5000×100/30 = $83.33
+    # min_size 2% = $100 보다 작지만 risk-cap 이 hard ceiling 으로 우선.
+    result = sizer.calculate(
+        capital=5000, win_rate=0.60, avg_win_R=2.0, avg_loss_R=1.0,
+        regime="TREND_UP", confidence=0.8, sample_count=30,
+        entry_price=100.0, stop_loss=70.0, risk_per_trade_pct=0.005,
+    )
+    assert result.size_usdt == pytest.approx(83.333, abs=1e-2)
+    assert result.size_usdt < 100.0                              # min_size 하한 아래
+    assert _loss_at_stop(result.size_usdt, 100.0, 70.0) <= 0.005 * 5000 + 1e-6
+
+
+def test_a1_zero_stop_distance_skips_risk_cap_no_zerodiv():
+    """sl==entry(손절거리 0) → ZeroDivision 없이 risk-cap 생략, 기존 cap 만 적용."""
+    sizer = DynamicPositionSizer()
+    result = sizer.calculate(
+        capital=5000, win_rate=0.60, avg_win_R=2.0, avg_loss_R=1.0,
+        regime="TREND_UP", confidence=0.8, sample_count=30,
+        entry_price=100.0, stop_loss=100.0, risk_per_trade_pct=0.005,
+    )
+    assert result.size_usdt == pytest.approx(500.0, abs=1e-6)   # baseline 유지
+    assert "risk-cap 생략" in result.reason
+
+
+def test_a1_no_risk_params_is_backward_compatible():
+    """entry/sl/risk_pct 미제공 → 기존 동작 100% 동일(시나리오 2와 일치)."""
+    sizer = DynamicPositionSizer()
+    result = sizer.calculate(
+        capital=5000, win_rate=0.60, avg_win_R=2.0, avg_loss_R=1.0,
+        regime="TREND_UP", confidence=0.8, sample_count=30,
+    )
+    assert result.size_usdt == pytest.approx(500.0, abs=1e-6)
+    assert "risk cap" not in result.reason
+
+
+@pytest.mark.parametrize("capital,entry,sl", [
+    (1000, 50.0, 47.0),
+    (5000, 100.0, 92.0),
+    (3000, 2.5, 2.1),
+    (10000, 30000.0, 28500.0),
+    (5000, 100.0, 110.0),   # SHORT 방향(sl>entry)도 |거리| 동일 처리
+])
+def test_a1_loss_never_exceeds_half_pct_rule(capital, entry, sl):
+    """다양한 (capital, entry, sl) 에서 손절 손실이 0.5% 룰을 절대 초과하지 않음."""
+    sizer = DynamicPositionSizer()
+    result = sizer.calculate(
+        capital=capital, win_rate=0.60, avg_win_R=2.0, avg_loss_R=1.0,
+        regime="TREND_UP", confidence=0.8, sample_count=30,
+        entry_price=entry, stop_loss=sl, risk_per_trade_pct=0.005,
+    )
+    if result.size_usdt > 0:
+        assert _loss_at_stop(result.size_usdt, entry, sl) <= 0.005 * capital + 1e-6

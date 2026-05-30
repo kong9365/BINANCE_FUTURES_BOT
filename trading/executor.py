@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sqlite3
 import time
 import uuid
@@ -63,6 +64,10 @@ _DRYRUN_QTY_PRECISION = 3
 
 # 수수료 추정용 기본 taker 율(실제 체결 수수료를 못 얻을 때만 사용 — CostGuard 기본값과 동일)
 _DEFAULT_TAKER_FEE = 0.00045
+# A4 [2.4]: 진입은 GTX(post-only)=maker 이므로 진입 수수료 추정엔 maker 율을 쓴다.
+_DEFAULT_MAKER_FEE = 0.00018
+# A4 [2.5]: 청산 체결가를 못 얻어 STOP가/진입가로 합성 처리한 행 표시(통계 제외용).
+_STOP_FALLBACK_FLAG = "_stop_fallback"
 
 # 진입 주문 미체결로 간주하지 않는 상태
 _TERMINAL_FAIL_STATES = {"CANCELED", "EXPIRED", "REJECTED"}
@@ -172,6 +177,19 @@ class TradeExecutor:
 
     # ── 진입 ────────────────────────────────────────────────────
 
+    @staticmethod
+    def _live_trading_authorized() -> bool:
+        """A5 [2.10] defense-in-depth: 실거래(live) 진입 인가 여부 (env 직접 확인).
+
+        testnet(USE_TESTNET=true) 은 안전하므로 허용. mainnet 은 명시적
+        LIVE_TRADING_ENABLED=true 일 때만 허용. main 게이트 우회 시의 최후 보루.
+        """
+        if os.environ.get("USE_TESTNET", "").strip().lower() in ("1", "true", "yes"):
+            return True
+        return os.environ.get("LIVE_TRADING_ENABLED", "").strip().lower() in (
+            "1", "true", "yes",
+        )
+
     async def enter_trade(self, decision: dict) -> dict:
         """진입 주문을 실행하고, 체결 + 보호주문 성공 시에만 기록한다.
 
@@ -224,6 +242,19 @@ class TradeExecutor:
                 entry_order_id=None, sl_order_id=None, tp_order_id=None,
             )
 
+        # ── live: A5 [2.10] defense-in-depth — 미인가 실거래 진입 차단 ──
+        # main 의 안전 게이트(_resolve_effective_dry_run)가 우회되어 dry_run=False
+        # 로 실거래 경로에 진입한 경우를 대비한 독립 검사(env 직접 확인). testnet
+        # 또는 LIVE_TRADING_ENABLED=true 가 아니면 신규 진입 실주문을 거부한다.
+        if not self._live_trading_authorized():
+            logger.critical(
+                "[Executor] %s live 진입 미인가 → 차단 "
+                "(USE_TESTNET≠true & LIVE_TRADING_ENABLED≠true, A5)", symbol,
+            )
+            return self._fail(
+                symbol, decision, "live_trading_not_authorized", critical=True,
+            )
+
         # ── live: Hedge Mode 차단 (A-4) ──
         # One-way Mode 전제. Hedge Mode 면 positionSide 누락/오매칭 위험이 있어
         # 신규 진입을 막는다. 조회 실패도 live 에서는 fail-closed.
@@ -246,6 +277,9 @@ class TradeExecutor:
             symbol, action, norm_qty, norm_price, leverage, client_order_id
         )
         if not confirm["filled"]:
+            # B7 [4-4]: 미체결/스킵 신호를 폐기하지 말고 영속화(forward-return 분석용).
+            # 계측은 거래 경로와 격리 — 실패해도 진입-스킵 흐름에 영향 0 (로그만).
+            self._record_unfilled_signal(decision, confirm.get("reason", "unknown"))
             # A-5: 조회 실패/타임아웃이 고아 포지션을 만들었을 수 있다 → critical 전파.
             # _await_fill 이 이미 강제청산했거나(orphan), 포지션 조회 실패로 fail-closed
             # 한 경우 critical=True 로 main 에서 즉시 Telegram 경고가 나가도록 한다.
@@ -1056,7 +1090,22 @@ class TradeExecutor:
                 positions = await self.get_open_positions()
                 target = next((p for p in positions if p.symbol == symbol), None)
                 if target is None:
-                    logger.info("[Executor] %s 열린 포지션 없음 — 청산 스킵", symbol)
+                    # A3 [2.7]: 거래소 STOP/TP 가 폴링 사이에 선체결되어 포지션이
+                    # 사라진 경우에도 미청산 trades 행을 CLOSED 로 마감한다(OPEN 고아
+                    # 방지). reconcile 과 동일 패턴 — 최근 체결로 청산가 추정 후 finalize.
+                    # (미청산 행이 없으면 _finalize_trade_exit 가 no-op.) 마감 실패는
+                    # 삼켜 success 반환을 보존한다(거래소 추가 주문 0 — 기존 동작 불변).
+                    logger.info(
+                        "[Executor] %s 열린 포지션 없음 — DB 마감 시도(고아 방지, A3)", symbol
+                    )
+                    try:
+                        np_exit, np_comm = await self._resolve_recent_fill(symbol)
+                        await asyncio.to_thread(
+                            self._finalize_trade_exit, symbol, "no_position",
+                            np_exit, np_comm,
+                        )
+                    except Exception as e:  # noqa: BLE001 — 마감 실패는 success 보존
+                        logger.error("[Executor] %s no_position 마감 실패: %s", symbol, e)
                     return {"success": True, "symbol": symbol,
                             "reason": "no_position", "portion": portion}
 
@@ -1324,7 +1373,7 @@ class TradeExecutor:
         conn = sqlite3.connect(self.db_path)
         try:
             row = conn.execute(
-                "SELECT id, timestamp, action, entry_price, quantity "
+                "SELECT id, timestamp, action, entry_price, quantity, stop_loss "
                 "FROM trades WHERE symbol = ? AND exit_price IS NULL "
                 "ORDER BY id DESC LIMIT 1",
                 (symbol,),
@@ -1332,24 +1381,42 @@ class TradeExecutor:
             if row is None:
                 logger.info("[Executor] %s 마감할 미청산 행 없음", symbol)
                 return
-            tid, ts, action, entry, qty = row
+            tid, ts, action, entry, qty, stop = row
             entry = float(entry or 0.0)
             qty = float(qty or 0.0)
+            stop = float(stop) if stop is not None else None
             if exit_price is None or exit_price <= 0:
-                logger.warning(
-                    "[Executor] %s 청산 체결가 미상 → 진입가 중립 처리(PnL 0 근사)", symbol
-                )
-                exit_price = entry
+                # A4 [2.5]: 청산 체결가 미상 시 진입가 중립(PnL 0=breakeven)은 손실을
+                # 숨긴다. STOP가가 있으면 그걸로 보수적 손실 처리하고, 합성 청산임을
+                # exit_reason 에 표시(A4b: expectancy 집계에선 제외, 연패 게이트엔 보수적
+                # 포함 — 운영자 결정 2026-05-30).
+                if stop is not None and stop > 0:
+                    logger.warning(
+                        "[Executor] %s 청산 체결가 미상 → STOP가 %.6g 로 보수적 손실 처리(A4)",
+                        symbol, stop,
+                    )
+                    exit_price = stop
+                else:
+                    logger.warning(
+                        "[Executor] %s 청산 체결가·STOP 모두 미상 → 진입가 중립(최후수단)", symbol
+                    )
+                    exit_price = entry
+                if _STOP_FALLBACK_FLAG not in reason:
+                    reason = f"{reason}{_STOP_FALLBACK_FLAG}"
 
             direction = 1.0 if action == "LONG" else -1.0
             pnl_usd = direction * (exit_price - entry) * qty
             entry_notional = entry * qty
             exit_notional = exit_price * qty
+            # A4 [2.4]: 진입은 GTX(post-only)=maker. 청산은 reduceOnly MARKET=taker.
             if exit_commission is not None:
-                # 청산 수수료는 실측, 진입 수수료는 taker 추정
-                fees_usd = entry_notional * _DEFAULT_TAKER_FEE + exit_commission
+                # 청산 수수료는 실측, 진입 수수료는 maker 율 추정.
+                fees_usd = entry_notional * _DEFAULT_MAKER_FEE + exit_commission
             else:
-                fees_usd = (entry_notional + exit_notional) * _DEFAULT_TAKER_FEE
+                fees_usd = (
+                    entry_notional * _DEFAULT_MAKER_FEE
+                    + exit_notional * _DEFAULT_TAKER_FEE
+                )
             pnl_usd_net = pnl_usd - fees_usd
             pnl_pct = (direction * (exit_price - entry) / entry * 100.0) if entry > 0 else 0.0
             duration = self._duration_seconds(ts)
@@ -1368,6 +1435,39 @@ class TradeExecutor:
             conn.commit()
         finally:
             conn.close()
+
+    def _record_unfilled_signal(self, decision: dict, reason: str) -> None:
+        """B7 [4-4]: 진입 미체결/스킵 신호 메타를 unfilled_signals 에 적재한다.
+
+        post-only(GTX) 미체결·타임아웃으로 폐기되던 신호를 보존해, 이후 +1/+3/+6
+        bar forward-return 을 채워 체결 역선택(B-3)을 검증할 수 있게 한다. 분석
+        리포트는 범위 외 — 적재 훅만 제공한다.
+
+        **거래 경로와 완전 격리**: 어떤 실패도 삼켜(로그만) 진입-스킵 흐름에 절대
+        영향을 주지 않는다(계측이 매매를 깨면 안 된다 — CLAUDE.md §4).
+        """
+        try:
+            ts = datetime.now(timezone.utc).isoformat()
+            entry_price = decision.get("entry_price")
+            signal_price = float(entry_price) if entry_price is not None else None
+            conn = sqlite3.connect(self.db_path)
+            try:
+                conn.execute(
+                    "INSERT INTO unfilled_signals "
+                    "(ts, symbol, action, setup_tag, signal_price, reason) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (ts, decision.get("symbol"), decision.get("action"),
+                     decision.get("setup_tag"), signal_price, reason),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            logger.info(
+                "[Executor] %s 미체결 신호 기록 (reason=%s, B7)",
+                decision.get("symbol"), reason,
+            )
+        except Exception as e:  # noqa: BLE001 — 계측 실패는 절대 매매 흐름에 영향 X
+            logger.warning("[Executor] 미체결 신호 기록 실패: %s (거래 영향 X)", e)
 
     def _reduce_trade_quantity(self, symbol: str, portion: float) -> None:
         """부분 청산 — 미청산 trades 행의 quantity 를 잔여 수량으로 감소시킨다.

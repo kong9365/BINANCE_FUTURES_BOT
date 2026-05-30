@@ -895,7 +895,8 @@ class MainBot:
         params = REGIME_TRADING_PARAMS[regime_state.regime]
 
         # 4) 리스크 한도 (capital_manager 자동 조회)
-        if not await self.risk_manager.check_all():
+        # A2 [2.3]: regime 전달 → 일일 거래수 레짐별 한도 검사 포함.
+        if not await self.risk_manager.check_all(regime=regime_state.regime):
             logger.info("[Risk] %s 리스크 한도 위반", symbol)
             if candidate is not None:
                 self.shadow.record_blocked("risk_manager", candidate, None)
@@ -918,6 +919,10 @@ class MainBot:
             regime=regime_state.regime,
             confidence=regime_state.confidence,
             sample_count=sample_count,
+            # A1 [2.2]: 손절거리 기반 risk cap (notional ≤ 0.5%/trade) — 사이즈 축소만.
+            entry_price=entry_price,
+            stop_loss=sl,
+            risk_per_trade_pct=RISK_RULES.risk_per_trade_pct,
         )
         if sizing.size_usdt < SYSTEM_CONFIG.min_notional_usdt:
             logger.info(
@@ -1530,13 +1535,44 @@ def _handle_termination_signal(signum, frame) -> None:
     raise KeyboardInterrupt()
 
 
+def _resolve_effective_dry_run(dry_run_flag: bool) -> bool:
+    """A5 [2.10]: 무플래그·무env 실행이 실거래를 시도하지 않도록 안전 기본값 강제.
+
+    - dry_run_flag=True → True (명시적 페이퍼).
+    - USE_TESTNET=true → False (testnet 주문은 안전 — 기존 .env 기반 동작 유지).
+    - mainnet + LIVE_TRADING_ENABLED≠true → True (실거래 미인가 → dry 강제, SAFE).
+    - mainnet + LIVE_TRADING_ENABLED=true → False (명시적 opt-in → live 허용).
+
+    실거래를 켜는 방향으로는 절대 바꾸지 않는다(안전쪽으로만 — 게이트 강화).
+    """
+    if dry_run_flag:
+        return True
+    use_testnet = os.environ.get("USE_TESTNET", "").strip().lower() in (
+        "1", "true", "yes",
+    )
+    if use_testnet:
+        return False
+    live_enabled = os.environ.get("LIVE_TRADING_ENABLED", "").strip().lower() in (
+        "1", "true", "yes",
+    )
+    if not live_enabled:
+        logger.warning(
+            "[Safety] mainnet 실거래인데 LIVE_TRADING_ENABLED≠true → dry-run 강제 "
+            "(실주문 차단, A5 [2.10]). 실거래하려면 LIVE_TRADING_ENABLED=true 설정."
+        )
+        return True
+    return False
+
+
 async def _amain(args: argparse.Namespace) -> None:
     """비동기 메인 — duration 지정 시 wait_for 로 종료.
 
     시작 시퀀스/메인 루프에서 발생한 예외는 raw traceback 대신 한 줄 에러
     로그로 정리하고 항상 shutdown() 을 거쳐 깔끔하게 종료한다.
     """
-    bot = MainBot(dry_run=args.dry_run)
+    # A5 [2.10]: 안전 기본값 — mainnet 실거래 미인가 시 dry_run 강제.
+    effective_dry_run = _resolve_effective_dry_run(args.dry_run)
+    bot = MainBot(dry_run=effective_dry_run)
     try:
         if args.duration > 0:
             try:

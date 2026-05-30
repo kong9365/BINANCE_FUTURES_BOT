@@ -605,11 +605,41 @@ async def test_close_full_live_zero_avgprice_uses_account_trades(db_path, mock_b
 
 
 async def test_close_position_live_no_position(db_path, mock_binance):
+    """미청산 행이 없을 때 no_position → success (A3: 마감할 행 없으면 no-op)."""
     mock_binance.futures_position_information.return_value = []
+    mock_binance.futures_account_trades.return_value = []   # 최근 체결 없음
     ex = TradeExecutor(mock_binance, db_path, dry_run=False)
     result = await ex.close_position("SOLUSDT", reason="system_critical")
     assert result["success"] is True
     assert result["reason"] == "no_position"
+    assert _fetch_trades(db_path) == []   # 시드 행 없음 → 변화 없음
+
+
+async def test_a3_no_position_finalizes_orphan_open_row(db_path, mock_binance):
+    """A3 [2.7]: 거래소 STOP 선체결로 포지션이 사라져도 미청산 행을 CLOSED 로 마감.
+
+    버그: 기존엔 no_position 분기가 _finalize_trade_exit 없이 success 만 반환 →
+    trades 행이 OPEN(exit_price NULL)으로 고아처럼 남았다. 이제 최근 체결로
+    청산가를 추정해 마감한다.
+    """
+    ex = TradeExecutor(mock_binance, db_path, dry_run=False)
+    _seed_open_trade(ex)   # entry 100, qty 0.5, OPEN
+    # 거래소에 포지션 없음(STOP 선체결) + 최근 체결 = STOP 체결가 99.0
+    mock_binance.futures_position_information.return_value = []
+    mock_binance.futures_account_trades.return_value = [
+        {"orderId": 999, "price": "99.0", "qty": "0.5", "commission": "0.02"},
+    ]
+
+    result = await ex.close_position("SOLUSDT", reason="system_critical")
+    assert result["success"] is True
+    assert result["reason"] == "no_position"
+
+    row = _fetch_trades(db_path)[0]
+    assert row["trade_status"] == "CLOSED"          # OPEN 고아로 남지 않음
+    assert row["exit_price"] is not None
+    assert row["exit_price"] == 99.0                # 최근 체결가로 마감
+    assert abs(row["pnl_usd"] - (-0.5)) < 1e-9      # (99-100)*0.5 LONG 손실
+    assert row["exit_reason"] == "no_position"
 
 
 # ── 13. 부분 청산 (분할 TP) ─────────────────────────────────────────
@@ -1022,3 +1052,195 @@ def test_extract_algo_id_returns_none_on_garbage():
     assert TradeExecutor._extract_algo_id(None) is None
     assert TradeExecutor._extract_algo_id({}) is None
     assert TradeExecutor._extract_algo_id("not a dict") is None
+
+
+# =====================================================================
+# A4 [2.4/2.5] — 진입 maker 수수료 + 청산가 미상 시 STOP가 보수적 손실
+# =====================================================================
+
+
+async def test_a4_entry_maker_fee_with_exit_commission(db_path, mock_binance):
+    """A4 [2.4]: 진입 수수료는 maker(0.00018), 청산 수수료는 실측."""
+    ex = TradeExecutor(mock_binance, db_path, dry_run=False)
+    _seed_open_trade(ex)   # entry 100, qty 0.5 → entry_notional 50
+    mock_binance.futures_position_information.return_value = [
+        {"symbol": "SOLUSDT", "positionAmt": "0.5", "entryPrice": "100.0",
+         "unRealizedProfit": "0.5"},
+    ]
+    mock_binance.futures_create_order.return_value = {
+        "avgPrice": "0", "orderId": 555, "executedQty": "0.5",
+    }
+    mock_binance.futures_account_trades.return_value = [
+        {"orderId": 555, "price": "101.0", "qty": "0.5", "commission": "0.02"},
+    ]
+    result = await ex.close_position("SOLUSDT", reason="take_profit")
+    assert result["success"] is True
+    row = _fetch_trades(db_path)[0]
+    # fees = entry_notional(50)×maker(0.00018) + exit_commission(0.02) = 0.029
+    assert abs(row["fees_usd"] - (50 * 0.00018 + 0.02)) < 1e-9
+
+
+async def test_a4_entry_maker_exit_taker_when_no_commission(db_path, mock_binance):
+    """A4 [2.4]: 실측 수수료 없을 때 진입 maker + 청산 taker 로 추정."""
+    ex = TradeExecutor(mock_binance, db_path, dry_run=False)
+    _seed_open_trade(ex)   # entry 100, qty 0.5
+    mock_binance.futures_position_information.return_value = [
+        {"symbol": "SOLUSDT", "positionAmt": "0.5", "entryPrice": "100.0",
+         "unRealizedProfit": "0.5"},
+    ]
+    mock_binance.futures_create_order.return_value = {
+        "avgPrice": "101.0", "orderId": 555, "executedQty": "0.5",
+    }
+    result = await ex.close_position("SOLUSDT", reason="take_profit")
+    assert result["success"] is True
+    row = _fetch_trades(db_path)[0]
+    # fees = entry_notional(50)×maker(0.00018) + exit_notional(50.5)×taker(0.00045)
+    expected = 50 * 0.00018 + 50.5 * 0.00045
+    assert abs(row["fees_usd"] - expected) < 1e-9
+
+
+def test_a4_exit_unknown_uses_stop_loss_conservative(db_path, mock_binance):
+    """A4 [2.5]: 청산 체결가 미상 → STOP가로 보수적 손실(PnL 0 아님) + 합성 플래그."""
+    ex = TradeExecutor(mock_binance, db_path, dry_run=False)
+    _seed_open_trade(ex)   # entry 100, sl 99, qty 0.5
+    # 체결가·수수료 모두 미상으로 finalize (reconcile 조회 실패 시뮬)
+    ex._finalize_trade_exit("SOLUSDT", "exchange_stop_or_tp", None, None)
+    row = _fetch_trades(db_path)[0]
+    assert row["trade_status"] == "CLOSED"
+    assert row["exit_price"] == 99.0                       # STOP가 사용
+    assert abs(row["pnl_usd"] - (-0.5)) < 1e-9             # (99-100)×0.5 손실 (breakeven 아님)
+    assert "_stop_fallback" in row["exit_reason"]          # 합성 청산 플래그(A4b 제외 대상)
+
+
+def test_a4_exit_unknown_no_stop_falls_back_to_entry_flagged(db_path, mock_binance):
+    """A4 [2.5]: STOP가도 없으면 진입가 중립(최후수단)이되 합성 플래그는 부착."""
+    ex = TradeExecutor(mock_binance, db_path, dry_run=False)
+    _seed_open_trade(ex, sl=0.0)   # stop_loss 0 → STOP 폴백 불가
+    ex._finalize_trade_exit("SOLUSDT", "manual", None, None)
+    row = _fetch_trades(db_path)[0]
+    assert row["trade_status"] == "CLOSED"
+    assert row["exit_price"] == 100.0                      # 진입가 중립(최후수단)
+    assert "_stop_fallback" in row["exit_reason"]          # 그래도 합성으로 표시
+
+
+# =====================================================================
+# A5 [2.10] — executor defense-in-depth: 미인가 live 주문 거부
+# =====================================================================
+
+
+@pytest.fixture(autouse=True)
+def _authorize_live_for_tests(monkeypatch):
+    """기존 live 테스트가 A5 가드를 통과하도록 인가 env 설정(테스트 전역).
+
+    개별 A5 차단 테스트는 같은 monkeypatch 로 delenv 하여 미인가 상태를 만든다.
+    """
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "true")
+
+
+def test_a5_authorized_when_testnet(monkeypatch):
+    monkeypatch.delenv("LIVE_TRADING_ENABLED", raising=False)
+    monkeypatch.setenv("USE_TESTNET", "true")
+    assert TradeExecutor._live_trading_authorized() is True
+
+
+def test_a5_authorized_when_optin(monkeypatch):
+    monkeypatch.delenv("USE_TESTNET", raising=False)
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "true")
+    assert TradeExecutor._live_trading_authorized() is True
+
+
+def test_a5_unauthorized_mainnet_no_optin(monkeypatch):
+    monkeypatch.delenv("USE_TESTNET", raising=False)
+    monkeypatch.delenv("LIVE_TRADING_ENABLED", raising=False)
+    assert TradeExecutor._live_trading_authorized() is False
+
+
+async def test_a5_live_entry_blocked_when_unauthorized(db_path, mock_binance, monkeypatch):
+    """미인가(mainnet, opt-in 없음) live 진입 → 차단 + 실주문 0 + 행 없음."""
+    monkeypatch.delenv("USE_TESTNET", raising=False)
+    monkeypatch.delenv("LIVE_TRADING_ENABLED", raising=False)
+    mock_binance.futures_exchange_info.return_value = _exinfo()
+
+    ex = TradeExecutor(mock_binance, db_path, dry_run=False)
+    result = await ex.enter_trade(_decision())
+
+    assert result["success"] is False
+    assert "not_authorized" in result["reason"]
+    mock_binance.futures_create_order.assert_not_called()   # 실주문 미발생
+    assert _fetch_trades(db_path) == []
+
+
+async def test_a5_dry_run_not_blocked_by_guard(db_path, mock_binance, monkeypatch):
+    """대조군: dry_run 은 미인가여도 가드와 무관(페이퍼 기록 정상)."""
+    monkeypatch.delenv("USE_TESTNET", raising=False)
+    monkeypatch.delenv("LIVE_TRADING_ENABLED", raising=False)
+    ex = TradeExecutor(mock_binance, db_path, dry_run=True)
+    result = await ex.enter_trade(_decision())
+    assert result["success"] is True       # dry_run 페이퍼 기록 정상
+
+
+# =====================================================================
+# B7 [4-4] — 미체결 신호 영속화 (unfilled_signals) + 계측 격리
+# =====================================================================
+
+
+def _fetch_unfilled(db_path: str) -> list[sqlite3.Row]:
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        return conn.execute("SELECT * FROM unfilled_signals").fetchall()
+    finally:
+        conn.close()
+
+
+async def test_b7_unfilled_signal_recorded_on_timeout(db_path, mock_binance):
+    """B7: post-only 미체결(타임아웃) → unfilled_signals 1행 기록, trades 0."""
+    mock_binance.futures_exchange_info.return_value = _exinfo()
+    mock_binance.futures_create_order.return_value = {"orderId": 111}
+    mock_binance.futures_get_order.return_value = {"status": "NEW", "executedQty": "0"}
+
+    ex = TradeExecutor(mock_binance, db_path, dry_run=False,
+                       fill_timeout_s=0.05, fill_poll_interval_s=0.01)
+    result = await ex.enter_trade(_decision())
+
+    assert result["success"] is False
+    assert _fetch_trades(db_path) == []          # 미체결 → trades 없음
+    rows = _fetch_unfilled(db_path)
+    assert len(rows) == 1                          # 미체결 신호 기록됨
+    r = rows[0]
+    assert r["symbol"] == "SOLUSDT"
+    assert r["action"] == "LONG"
+    assert r["setup_tag"] == "oi_surge_long"
+    assert r["signal_price"] == 100.0
+    assert "timeout" in r["reason"]
+    assert r["fwd_return_1bar"] is None            # forward-return 은 나중에 채움
+
+
+async def test_b7_filled_entry_records_no_unfilled(db_path, mock_binance):
+    """대조군: 정상 체결은 trades 에만, unfilled_signals 에는 기록 안 함(구분 조회)."""
+    mock_binance.futures_exchange_info.return_value = _exinfo()
+    mock_binance.futures_create_order.return_value = {"orderId": 111}
+    mock_binance.futures_create_algo_order.side_effect = [
+        {"algoId": 222, "clientAlgoId": "x"}, {"algoId": 333, "clientAlgoId": "y"},
+    ]
+    mock_binance.futures_get_order.return_value = {
+        "status": "FILLED", "executedQty": "0.5", "avgPrice": "100.0",
+    }
+    ex = TradeExecutor(mock_binance, db_path, dry_run=False)
+    result = await ex.enter_trade(_decision())
+
+    assert result["success"] is True
+    assert len(_fetch_trades(db_path)) == 1        # 체결 → trades
+    assert _fetch_unfilled(db_path) == []          # unfilled 없음
+
+
+def test_b7_record_unfilled_swallows_error_isolated(mock_binance, tmp_path):
+    """B7: 계측은 거래 경로와 격리 — DB 실패해도 예외 전파 없이 삼킨다."""
+    bad_path = str(tmp_path / "no_such_dir" / "x.db")
+    ex = TradeExecutor(mock_binance, bad_path, dry_run=False)
+    # 존재하지 않는 경로 → INSERT 불가하지만 예외가 전파되면 안 됨(로그만).
+    ex._record_unfilled_signal(
+        {"symbol": "SOLUSDT", "action": "LONG", "entry_price": 100.0,
+         "setup_tag": "oi_surge_long"},
+        "fill_timeout",
+    )   # 예외 미발생 = 격리 정상

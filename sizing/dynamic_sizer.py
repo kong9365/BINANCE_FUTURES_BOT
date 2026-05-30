@@ -157,6 +157,9 @@ class DynamicPositionSizer:
         regime: str,
         confidence: float = 0.7,         # 레짐 신뢰도 0~1
         sample_count: int = 0,           # 승률 표본 수 (0이면 매우 보수적)
+        entry_price: float | None = None,      # A1 [2.2]: risk-cap 입력 (선택)
+        stop_loss: float | None = None,        # A1 [2.2]: 손절가 (선택)
+        risk_per_trade_pct: float | None = None,  # A1 [2.2]: 거래당 리스크 비율 (선택)
     ) -> SizingResult:
         """포지션 사이즈 계산.
 
@@ -168,6 +171,11 @@ class DynamicPositionSizer:
             regime: 시장 레짐 문자열. "HIGH_VOL"이면 진입 차단.
             confidence: 레짐 신뢰도 (0~1). confidence_min_factor 미만이면 상향.
             sample_count: 승률 표본 수. 20/50 미만이면 단계적 축소.
+            entry_price: 진입가. stop_loss/risk_per_trade_pct 와 함께 주어지면
+                A1 [2.2] risk-based notional cap 을 추가 적용한다 (사이즈 축소만).
+            stop_loss: 손절가. entry_price 와의 거리로 거래당 리스크를 산정한다.
+            risk_per_trade_pct: 거래당 허용 리스크 비율 (예: 0.005 = 0.5%).
+                세 인자 중 하나라도 None 이면 risk-cap 은 비활성(기존 동작 불변).
 
         Returns:
             SizingResult: 사이징 결과 (size_pct, size_usdt, 근거 등).
@@ -247,6 +255,34 @@ class DynamicPositionSizer:
             reasons.append(f"cap 적용: {final_cap*100:.1f}%")
         if abs(size_pct - self.min_size_pct) < 1e-6:
             reasons.append(f"최소값 적용: {self.min_size_pct*100:.1f}%")
+
+        # ── A1 [2.2]: risk-per-trade 기반 notional cap (손절거리 반영) ──
+        # notional ≤ risk_pct × capital × entry / |entry−sl| 를 기존 cap 과 min 결합.
+        # hard ceiling 이므로 min_size 하한보다 낮아질 수 있다(리스크 우선). 사이즈는
+        # 줄어들기만 한다. 세 인자 미제공 시 비활성(기존 동작 100% 불변).
+        if (
+            entry_price is not None and stop_loss is not None
+            and risk_per_trade_pct is not None
+            and risk_per_trade_pct > 0 and entry_price > 0
+        ):
+            stop_dist = abs(entry_price - stop_loss)
+            # zero-division 가드: sl==entry(또는 극소 거리)면 risk-cap 생략(폭발 방지).
+            if stop_dist <= entry_price * 1e-9:
+                logger.warning(
+                    "[Sizer] 손절거리 0/극소 (entry=%s, sl=%s) → risk-cap 생략",
+                    entry_price, stop_loss,
+                )
+                reasons.append("손절거리 0 → risk-cap 생략")
+            else:
+                risk_cap_usdt = risk_per_trade_pct * capital * entry_price / stop_dist
+                if risk_cap_usdt < size_usdt:
+                    size_usdt = risk_cap_usdt
+                    size_pct = size_usdt / capital   # min_size 하한 아래로도 가능
+                    logger.info(
+                        "[Sizer] risk-cap 적용: risk %.2f%%/trade → notional $%.2f",
+                        risk_per_trade_pct * 100, size_usdt,
+                    )
+                    reasons.append(f"risk cap {risk_per_trade_pct*100:.2f}%/trade 적용")
 
         return SizingResult(
             size_pct=round(size_pct * 100, 3),

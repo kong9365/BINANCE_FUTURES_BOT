@@ -36,7 +36,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from config.settings import RISK_RULES
+from config.settings import REGIME_TRADING_PARAMS, RISK_RULES
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +87,7 @@ class RiskManager:
 
     # ── 메인 게이트 ─────────────────────────────────────────────
 
-    async def check_all(self) -> bool:
+    async def check_all(self, regime: str | None = None) -> bool:
         """모든 리스크 체크를 실행하고 전체 통과 여부를 반환한다.
 
         부록 E-4-2: 자본은 capital_manager에서 자동 조회한다. snapshot /
@@ -95,11 +95,15 @@ class RiskManager:
         즉시 차단한다.
 
         DB 의존 체크(_check_consecutive_losses / _check_monthly_drawdown /
-        _check_concurrent_positions / _check_cooldown)는 sqlite3가 동기
-        라이브러리이므로 asyncio.to_thread로 래핑한다.
+        _check_concurrent_positions / _check_cooldown / _check_daily_trade_count)는
+        sqlite3가 동기 라이브러리이므로 asyncio.to_thread로 래핑한다.
+
+        Args:
+            regime: 현재 시장 레짐 (A2 [2.3] 일일 거래수 한도용). None 이면
+                전역 RISK_RULES.max_daily_trades(5)를, 주어지면 레짐별 한도를 쓴다.
 
         Returns:
-            7개 체크 전부 통과 시 True, 하나라도 차단 시 False.
+            8개 체크 전부 통과 시 True, 하나라도 차단 시 False.
         """
         if self.capital_manager is None:
             logger.warning("[Risk] capital_manager 미주입 → 차단")
@@ -135,6 +139,7 @@ class RiskManager:
             ),
             self._check_min_balance(snapshot.available_balance),
             await asyncio.to_thread(self._check_cooldown),
+            await asyncio.to_thread(self._check_daily_trade_count, regime),
         ]
 
         all_passed = True
@@ -371,6 +376,38 @@ class RiskManager:
             reason=f"{streak}연패 쿨다운 종료 (경과 {elapsed_hours:.1f}시간)",
         )
 
+    def _check_daily_trade_count(self, regime: str | None = None) -> CheckResult:
+        """일일 거래수 한도 검사 (A2 [2.3]).
+
+        오늘(현재 UTC 00:00 이후) 신규 진입된 trades 행 수가 한도 이상이면
+        과매매 방지를 위해 신규 진입을 차단한다. 한도는 regime 이 주어지면
+        REGIME_TRADING_PARAMS[regime].max_daily_trades(레짐별), 없거나 미정의
+        레짐이면 RISK_RULES.max_daily_trades(전역 5)를 쓴다 (운영자 결정 D1=ⓐ).
+
+        DB 조회 실패 시 안전 우선 원칙으로 차단(passed=False)한다.
+
+        Args:
+            regime: 현재 시장 레짐 문자열 (선택).
+        """
+        limit = RISK_RULES.max_daily_trades
+        if regime is not None:
+            params = REGIME_TRADING_PARAMS.get(regime)
+            if params is not None:
+                limit = params.max_daily_trades
+
+        try:
+            count = self._get_today_trade_count()
+        except Exception as e:  # noqa: BLE001 — DB 실패는 안전 차단
+            logger.error("[Risk] 일일 거래수 조회 실패: %s → 안전 차단", e)
+            return CheckResult(passed=False, reason="일일 거래수 DB 조회 실패 → 안전 차단")
+
+        if count >= limit:
+            return CheckResult(
+                passed=False,
+                reason=f"일일 거래수 {count}/{limit} (한도 도달)",
+            )
+        return CheckResult(passed=True, reason=f"일일 거래수 {count}/{limit}")
+
     # ── 자본/레짐 매핑 (§9-2 본문 1:1) ──────────────────────────
 
     def get_max_concurrent_positions(self, capital: float) -> int:
@@ -426,6 +463,9 @@ class RiskManager:
                 SELECT timestamp, COALESCE(pnl_usd_net, pnl_usd) AS net_pnl
                 FROM trades
                 WHERE exit_price IS NOT NULL
+                -- A4b (운영자 결정 2026-05-30): 연패(쿨다운/terminal)는 *안전 게이트*
+                -- 이므로 합성 청산(_stop_fallback)도 손실로 *포함*한다(보수적 = 과차단
+                -- 방향). expectancy 쪽만 제외(엣지 통계 편향 방지). 방향이 중요.
                 ORDER BY id DESC
                 """
             ).fetchall()
@@ -463,6 +503,24 @@ class RiskManager:
         finally:
             conn.close()
         return float(row[0]) if row and row[0] is not None else 0.0
+
+    def _get_today_trade_count(self) -> int:
+        """오늘(현재 UTC 00:00 이후) 진입된 trades 행 수를 반환한다 (A2 [2.3]).
+
+        trades.timestamp 는 UTC ISO 문자열이라 'YYYY-MM-DDT00:00:00' 과의
+        문자열 비교가 곧 시간 비교가 된다(동일 포맷 → 사전식 == 시간순).
+        체결/미체결 무관하게 '오늘 진입한 거래 수'를 센다(과매매 방지 목적).
+        """
+        today_start = datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00")
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM trades WHERE timestamp >= ?",
+                (today_start,),
+            ).fetchone()
+        finally:
+            conn.close()
+        return int(row[0]) if row and row[0] is not None else 0
 
     def _get_open_position_count(self) -> int:
         """열린 포지션(exit_price IS NULL) 수를 반환한다."""

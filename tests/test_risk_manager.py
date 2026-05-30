@@ -314,3 +314,131 @@ async def test_loss_streak_uses_real_pnl_net(db_path):
     assert streak == 3
     assert last_loss_at is not None
     assert await rm.check_all() is False
+
+
+# =====================================================================
+# A2 [2.3] — _check_daily_trade_count (레짐별 한도, regime=None → 전역 5)
+# =====================================================================
+
+
+def _insert_trades_today(db_path: str, n: int) -> None:
+    """오늘(현재 UTC) timestamp 로 진입 행 N건 삽입 (일일 거래수 카운트용)."""
+    conn = sqlite3.connect(db_path)
+    try:
+        ts = datetime.now(timezone.utc).isoformat()
+        for _ in range(n):
+            conn.execute(
+                "INSERT INTO trades (timestamp, symbol, action, entry_price, quantity) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (ts, "SOLUSDT", "LONG", 100.0, 1.0),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+async def test_a2_global_limit_blocks_at_5(db_path):
+    """regime=None → 전역 한도 5. 오늘 5건 도달 시 차단."""
+    _insert_trades_today(db_path, 5)
+    rm = RiskManager(db_path=db_path, capital_manager=_make_cm())
+    result = rm._check_daily_trade_count(regime=None)
+    assert result.passed is False
+    assert "일일 거래수 5/5" in result.reason
+
+
+async def test_a2_global_limit_passes_under_5(db_path):
+    """regime=None → 전역 5. 오늘 4건이면 통과(다음 1건 허용)."""
+    _insert_trades_today(db_path, 4)
+    rm = RiskManager(db_path=db_path, capital_manager=_make_cm())
+    result = rm._check_daily_trade_count(regime=None)
+    assert result.passed is True
+    assert "4/5" in result.reason
+
+
+async def test_a2_regime_specific_ranging_blocks_at_1(db_path):
+    """regime=RANGING → 한도 1. 오늘 1건이면 다음 진입 차단(더 엄격)."""
+    _insert_trades_today(db_path, 1)
+    rm = RiskManager(db_path=db_path, capital_manager=_make_cm())
+    result = rm._check_daily_trade_count(regime="RANGING")
+    assert result.passed is False
+    assert "1/1" in result.reason
+
+
+async def test_a2_regime_specific_trend_up_allows_under_5(db_path):
+    """regime=TREND_UP → 한도 5. 오늘 1건이면 통과."""
+    _insert_trades_today(db_path, 1)
+    rm = RiskManager(db_path=db_path, capital_manager=_make_cm())
+    result = rm._check_daily_trade_count(regime="TREND_UP")
+    assert result.passed is True
+    assert "1/5" in result.reason
+
+
+async def test_a2_unknown_regime_falls_back_to_global(db_path):
+    """알 수 없는 regime → 전역 한도 5 폴백."""
+    _insert_trades_today(db_path, 4)
+    rm = RiskManager(db_path=db_path, capital_manager=_make_cm())
+    result = rm._check_daily_trade_count(regime="NOT_A_REGIME")
+    assert result.passed is True
+    assert "4/5" in result.reason
+
+
+async def test_a2_db_failure_fails_closed(db_path):
+    """DB 조회 실패 → 안전 우선 차단(passed=False)."""
+    rm = RiskManager(db_path="/nonexistent/dir/nope.db", capital_manager=_make_cm())
+    result = rm._check_daily_trade_count(regime=None)
+    assert result.passed is False
+    assert "DB 조회 실패" in result.reason
+
+
+async def test_a2_check_all_includes_daily_trade_count(db_path):
+    """check_all(regime=RANGING) 가 일일 거래수 한도를 반영해 차단한다."""
+    _insert_trades_today(db_path, 1)   # RANGING 한도 1 도달
+    rm = RiskManager(db_path=db_path, capital_manager=_make_cm())
+    assert await rm.check_all(regime="RANGING") is False
+
+
+# =====================================================================
+# A4b [가드] — 안전 게이트(연패)는 보수적: 합성 청산(_stop_fallback)도 손실로 포함
+# 운영자 결정 (2026-05-30): expectancy 쪽만 제외, loss-streak 은 과차단 방향 유지.
+# =====================================================================
+
+
+def _insert_stop_fallback_losses(db_path: str, n: int) -> None:
+    """exit_reason 에 _stop_fallback 가 붙은 합성 손실 N건 삽입."""
+    conn = sqlite3.connect(db_path)
+    try:
+        ts = datetime.now(timezone.utc).isoformat()
+        for _ in range(n):
+            conn.execute(
+                "INSERT INTO trades "
+                "(timestamp, symbol, action, entry_price, exit_price, "
+                " quantity, pnl_usd, pnl_usd_net, exit_reason) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (ts, "SOLUSDT", "LONG", 100.0, 99.0, 1.0, -5.0, -5.0,
+                 "no_position_stop_fallback"),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+async def test_a4b_stop_fallback_included_in_loss_streak(db_path):
+    """안전 게이트(연패/쿨다운)는 보수적 — 합성 청산 손실도 손실로 *포함*(streak 3).
+
+    운영자 결정 (2026-05-30): expectancy(엣지 통계)는 합성 제외 유지하되,
+    loss-streak 은 과차단(안전) 방향으로 합성 손실을 포함한다. 빈도는 드물어도
+    방향이 중요(보수적 게이트).
+    """
+    _insert_stop_fallback_losses(db_path, 3)
+    rm = RiskManager(db_path=db_path, capital_manager=_make_cm())
+    streak, last_loss_at = rm._get_loss_streak()
+    assert streak == 3
+    assert last_loss_at is not None
+
+
+async def test_a4b_normal_loss_still_counts_in_streak(db_path):
+    """대조군: 합성 아닌 정상 손실도 당연히 연패로 집계(기존 동작 유지)."""
+    _insert_closed_loss_trades(db_path, 2, pnl_each=-5.0)   # exit_reason NULL
+    rm = RiskManager(db_path=db_path, capital_manager=_make_cm())
+    streak, _ = rm._get_loss_streak()
+    assert streak == 2
