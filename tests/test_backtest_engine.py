@@ -381,3 +381,102 @@ def test_b6_post_only_strict_skips_on_open_gap_up():
     df2 = _two_bar_df(prev_close=100.0, o=99.5, h=101.0, l=99.0, c=100.5)
     f2, e2 = _engine_with(df2, "post_only_strict")._resolve_entry_fill("X", TS_ENTRY, "LONG")
     assert f2 is True and e2 == 100.0
+
+
+# =====================================================================
+# Phase C 후보 "개선된 돌파" — 게이트 단위테스트 (룩어헤드 포함)
+# =====================================================================
+
+
+def test_pc_btc_risk_on_uptrend_true():
+    eng = BacktestEngine(BacktestConfig(pairs=["BTCUSDT"], macro_btc_ema_period=5))
+    btc = make_candles("up", n=20)
+    eng._candles_by_pair = {"BTCUSDT": btc}
+    assert eng._btc_risk_on(btc.index[15]) is True       # 상승 → close>EMA5 = risk-on
+
+
+def test_pc_btc_risk_off_downtrend_false():
+    eng = BacktestEngine(BacktestConfig(pairs=["BTCUSDT"], macro_btc_ema_period=5))
+    btc = make_candles("down", n=20)
+    eng._candles_by_pair = {"BTCUSDT": btc}
+    assert eng._btc_risk_on(btc.index[15]) is False       # 하락 → risk-off
+
+
+def test_pc_btc_risk_on_lookahead_free():
+    """index < ts 만 — 표본 부족(EMA5 미만)이면 보수적 False."""
+    eng = BacktestEngine(BacktestConfig(pairs=["BTCUSDT"], macro_btc_ema_period=5))
+    btc = make_candles("up", n=20)
+    eng._candles_by_pair = {"BTCUSDT": btc}
+    assert eng._btc_risk_on(btc.index[3]) is False        # <ts 표본 3 < 6 → False
+
+
+def test_pc_btc_risk_on_no_btc_data_false():
+    eng = BacktestEngine(BacktestConfig(pairs=["X"], macro_btc_ema_period=5))
+    eng._candles_by_pair = {"X": make_candles("up", n=20)}   # BTC 없음
+    assert eng._btc_risk_on(TS0 + 10 * INTERVAL) is False
+
+
+def test_pc_volume_confirm_pass_and_block():
+    eng = BacktestEngine(BacktestConfig(
+        pairs=["X"], volume_confirm_mult=1.5, volume_confirm_bars=3))
+    ok = [(1, 1, 1, 1, 100, 0)] * 3 + [(1, 1, 1, 1, 200, 0)]   # 200 > 1.5×100
+    assert eng._passes_volume_confirm(ok) is True
+    no = [(1, 1, 1, 1, 100, 0)] * 3 + [(1, 1, 1, 1, 120, 0)]   # 120 < 150
+    assert eng._passes_volume_confirm(no) is False
+
+
+def test_pc_volume_confirm_off_always_true():
+    eng = BacktestEngine(BacktestConfig(pairs=["X"], volume_confirm_mult=0.0))
+    assert eng._passes_volume_confirm([(1, 1, 1, 1, 1, 0)]) is True
+
+
+def test_pc_universe_excludes_protected():
+    eng = BacktestEngine(BacktestConfig(pairs=["BTCUSDT"], min_trailing_volume_usd=1.0))
+    eng._candles_by_pair = {"BTCUSDT": make_candles("up", n=40)}
+    assert eng._passes_universe_filter("BTCUSDT", TS0 + 35 * INTERVAL) is False
+
+
+def test_pc_universe_volume_threshold():
+    df = make_candles("up", n=40)   # close~50000 × vol 1000 = 거래대금 ~50M/봉
+    eng_hi = BacktestEngine(BacktestConfig(
+        pairs=["X"], min_trailing_volume_usd=1e9, trailing_volume_bars=10))
+    eng_hi._candles_by_pair = {"X": df}
+    assert eng_hi._passes_universe_filter("X", df.index[35]) is False   # 50M < 1B
+    eng_lo = BacktestEngine(BacktestConfig(
+        pairs=["X"], min_trailing_volume_usd=1e6, trailing_volume_bars=10))
+    eng_lo._candles_by_pair = {"X": df}
+    assert eng_lo._passes_universe_filter("X", df.index[35]) is True    # 50M ≥ 1M
+
+
+def test_pc_risk_based_sizing_half_pct():
+    """risk 0.5%: notional 산출 시 stop 도달 손실이 정확히 0.5%×equity (risk≠notional)."""
+    eng = BacktestEngine(BacktestConfig(pairs=["X"], risk_per_trade_pct=0.005))
+    notional = eng._size_position(10000.0, 100.0, 98.0, None)   # stop_dist 2
+    assert abs(notional - 2500.0) < 1e-6                        # 0.005×10000×100/2
+    loss_at_stop = (notional / 100.0) * (100.0 - 98.0)
+    assert abs(loss_at_stop - 0.005 * 10000.0) < 1e-6          # = 50 = 0.5% 계좌
+
+
+def test_pc_risk_sizing_zero_stop_returns_zero():
+    eng = BacktestEngine(BacktestConfig(pairs=["X"], risk_per_trade_pct=0.005))
+    assert eng._size_position(10000.0, 100.0, 100.0, None) == 0.0   # stop_dist 0
+
+
+def test_pc_breakout_full_flow_risk_sizing_no_crash():
+    """strategy=breakout + Phase C 플래그(risk-sizing/concurrent/trail) end-to-end.
+
+    회귀 가드: 진입 평가→사이징→시뮬레이션이 크래시 없이 result 반환(과거 sizing
+    변수 누락 NameError 재발 방지). risk_per_trade_pct>0 → 모든 거래 notional>0.
+    """
+    candles = make_candles("up", n=250, atr_pct=1.0)   # 상승 → 돌파 신호 발생
+    cfg = BacktestConfig(
+        pairs=["X"], strategy="breakout",
+        risk_per_trade_pct=0.005, max_concurrent_positions=5,
+        breakout_trail_exit=True, breakout_trail_atr_mult=3.0,
+        breakout_atr_stop=2.0,
+    )
+    result = BacktestEngine(cfg).run({"X": candles})
+    assert result.total_trades >= 0                   # 크래시 없이 완료
+    assert isinstance(result.trades, list)
+    for t in result.trades:
+        assert t.size_usdt > 0                        # risk-based notional 산출됨

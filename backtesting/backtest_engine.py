@@ -50,7 +50,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 
 from sizing.dynamic_sizer import DynamicPositionSizer
-from strategy.breakout import BreakoutConfig, evaluate_breakout
+from strategy.breakout import BreakoutConfig, ema, evaluate_breakout
 from strategy.cost_guard import CostGuard
 from strategy.regime_detector import Regime, RegimeDetector
 
@@ -68,6 +68,12 @@ REQUIRED_COLUMNS = ("open", "high", "low", "close", "volume")
 
 # 페어별 슬리피지 Tier (그 외는 기본 2)
 PAIR_TIERS: Dict[str, int] = {"BTCUSDT": 1, "ETHUSDT": 1}
+
+# 보호종목 — 백테스트 유니버스에서 항상 제외 (CLAUDE.md TIER 1). BTCUSDT 는
+# 매크로 게이트(200EMA) 입력으로 데이터만 쓰고 거래 대상에선 빠진다.
+_PROTECTED_SYMBOLS = frozenset(
+    {"BTCUSDT", "ETHUSDT", "HOLOUSDT", "CFXUSDT", "LYNUSDT", "INJUSDT"}
+)
 
 # 백테스트 사이징용 보수적 사전값 (실측 데이터 없음 — §8-3 default 정책과 정합)
 _DEFAULT_BACKTEST_WIN_RATE = 0.45
@@ -134,6 +140,19 @@ class BacktestConfig:
     #   "maker_open": 기존 가정(봉 ts open 확정 체결 + maker 진입). 비교 보존용 (legacy).
     entry_fill_model: str = "post_only"
 
+    # ── Phase C 후보: "개선된 돌파" 게이트 (모두 기본 off → 기존 동작 불변) ──
+    # 사전확정 단일값(스윕 금지). breakout 전략에만 적용.
+    long_only: bool = False                    # True: SHORT 신호 배제(롱 전용)
+    volume_confirm_mult: float = 0.0           # >0: 돌파봉 vol > mult×직전 N봉 평균 이어야 진입
+    volume_confirm_bars: int = 20              # 거래량 평균 lookback
+    macro_btc_ema_period: int = 0              # >0: BTC close[<ts] > BTC EMA 일 때만 신규 롱(risk-on)
+    min_trailing_volume_usd: float = 0.0       # >0: 직전 N봉 평균 거래대금 미만 종목 제외
+    trailing_volume_bars: int = 30             # 거래대금 랭킹 lookback
+    # risk-based 사이징: >0 이면 Kelly 대신 *계좌 risk* 고정.
+    # notional = risk_per_trade_pct × equity × entry / |entry−stop|  (stop 도달=이 risk 손실)
+    risk_per_trade_pct: float = 0.0            # 0.005 = 코인당 0.5% 계좌 risk (A1 정합)
+    max_concurrent_positions: int = 0          # >0: 동시 오픈 포지션 cap(없으면 하루 1회 기존)
+
     # 백테스트 시 펀딩비 적용 여부
     apply_funding: bool = True
 
@@ -179,6 +198,9 @@ class BacktestResult:
     # 시계열
     equity_curve: List[Tuple[datetime, float]]
     drawdown_curve: List[Tuple[datetime, float]]
+
+    # 개별 거래 (거래당 gross/cost/net edge·분포 분석용). 기본 빈 리스트.
+    trades: List["Trade"] = field(default_factory=list)
 
 
 @dataclass
@@ -329,8 +351,13 @@ class BacktestEngine:
         blocked_until: Dict[str, Optional[Any]] = {p: None for p in tradable}
         # 하루 1회 한도 카운터
         trades_by_day: Dict[date, int] = {}
+        # Phase C: 동시 오픈 포지션 exit_ts 추적 (max_concurrent_positions cap 용)
+        open_exits: List[Any] = []
 
         for ts in self._iter_timestamps():
+            # 만기 도래분 정리(동시보유 카운트용) — exit_ts ≤ ts 면 청산됨
+            if self.config.max_concurrent_positions > 0:
+                open_exits = [e for e in open_exits if e > ts]
             # ── 1. 룩어헤드 차단 슬라이스 (단계 1·2) ──
             ref_candles = self._get_candles_until(self._regime_ref, "4h", ts)
             funding = self._get_funding_at(self._regime_ref, ts)
@@ -355,11 +382,18 @@ class BacktestEngine:
             # ── 3. 각 페어 시그널 평가 ──
             day = self._day_key(ts)
             for symbol in tradable:
+                # Phase C: 동적 mid-liquidity 유니버스 (off 면 전체 통과)
+                if (self.config.min_trailing_volume_usd > 0
+                        and not self._passes_universe_filter(symbol, ts)):
+                    continue
                 # 심볼별 중복 진입 차단
                 if blocked_until[symbol] is not None and ts <= blocked_until[symbol]:
                     continue
-                # 하루 1회 한도
-                if trades_by_day.get(day, 0) >= 1:
+                # 진입 한도: max_concurrent_positions>0 면 동시보유 cap, 아니면 하루 1회(기존)
+                if self.config.max_concurrent_positions > 0:
+                    if len(open_exits) >= self.config.max_concurrent_positions:
+                        break
+                elif trades_by_day.get(day, 0) >= 1:
                     break
 
                 signal = self._evaluate_signal(symbol, ts, regime_state, equity)
@@ -388,6 +422,7 @@ class BacktestEngine:
                 equity += trade.pnl_usd
                 blocked_until[symbol] = trade.exit_ts
                 trades_by_day[day] = trades_by_day.get(day, 0) + 1
+                open_exits.append(trade.exit_ts)   # Phase C 동시보유 카운트
 
             equity_curve.append(
                 (self._to_dt(ts), self._mark_to_market(equity, [], ts))
@@ -481,6 +516,89 @@ class BacktestEngine:
         else:  # SHORT
             filled = float(df.at[ts, "high"]) >= limit
         return (filled, limit if filled else None)
+
+    def _btc_risk_on(self, ts: Any) -> bool:
+        """BTC 매크로 게이트 — BTC 직전 마감 close > BTC EMA(≤직전봉) 면 risk-on.
+
+        룩어헤드 0(`index < ts` 만). BTC 데이터/표본 부족 시 보수적으로 False(진입 금지).
+        """
+        period = self.config.macro_btc_ema_period
+        btc = self._candles_by_pair.get("BTCUSDT")
+        if btc is None or period <= 0:
+            return False
+        closes = btc.loc[btc.index < ts, "close"]
+        if len(closes) < period + 1:
+            return False
+        e = ema([float(x) for x in closes.values], period)
+        if e is None:
+            return False
+        return float(closes.iloc[-1]) > e
+
+    def _passes_volume_confirm(self, closed: list) -> bool:
+        """거래량 동반 돌파 — 돌파봉(마지막 마감봉) vol > mult × 직전 N봉 평균.
+
+        config.volume_confirm_mult ≤ 0 이면 항상 통과(off). 표본 부족 시 False.
+        closed 는 (o,h,l,c,v,ts) 튜플 리스트 → 거래량 index 4.
+        """
+        mult = self.config.volume_confirm_mult
+        if mult <= 0:
+            return True
+        n = self.config.volume_confirm_bars
+        if len(closed) < n + 1:
+            return False
+        vols = [float(c[4]) for c in closed]
+        avg_prior = sum(vols[-(n + 1):-1]) / n
+        if avg_prior <= 0:
+            return False
+        return vols[-1] > mult * avg_prior
+
+    def _passes_universe_filter(self, symbol: str, ts: Any) -> bool:
+        """동적 mid-liquidity 유니버스 — 보호종목 제외 + 직전 N봉 평균 거래대금 하한.
+
+        거래대금 = close×volume, `index < ts` 만(룩어헤드 0).
+        config.min_trailing_volume_usd ≤ 0 이면 보호종목 제외만 적용.
+        """
+        if symbol in _PROTECTED_SYMBOLS:
+            return False
+        thr = self.config.min_trailing_volume_usd
+        if thr <= 0:
+            return True
+        df = self._candles_by_pair.get(symbol)
+        if df is None:
+            return False
+        prior = df.loc[df.index < ts]
+        n = self.config.trailing_volume_bars
+        if len(prior) < n:
+            return False
+        window = prior.iloc[-n:]
+        avg_qv = float((window["close"] * window["volume"]).mean())
+        return avg_qv >= thr
+
+    def _size_position(
+        self, equity: float, entry_price: float, sl_price: float, regime_state,
+    ) -> float:
+        """포지션 *명목(notional, USDT)* 산출.
+
+        config.risk_per_trade_pct > 0 면 *계좌 risk* 고정:
+            notional = risk_pct × equity × entry / |entry−sl|
+        → stop(=sl) 도달 시 손실이 정확히 risk_pct×equity (A1 정합). 0 이면 Kelly(기존).
+        주의: 반환값은 risk 가 아니라 **명목 크기**다(혼동 금지).
+        """
+        if self.config.risk_per_trade_pct > 0:
+            stop_dist = abs(entry_price - sl_price)
+            if stop_dist <= 0 or entry_price <= 0:
+                return 0.0
+            return self.config.risk_per_trade_pct * equity * entry_price / stop_dist
+        sizing = self.sizer.calculate(
+            capital=equity,
+            win_rate=_DEFAULT_BACKTEST_WIN_RATE,
+            avg_win_R=_DEFAULT_BACKTEST_WIN_R,
+            avg_loss_R=_DEFAULT_BACKTEST_LOSS_R,
+            regime=regime_state.regime,
+            confidence=regime_state.confidence,
+            sample_count=0,
+        )
+        return sizing.size_usdt
 
     def _evaluate_signal(
         self,
@@ -655,6 +773,16 @@ class BacktestEngine:
         if sig is None:
             return None
 
+        # ── Phase C 게이트 (config 플래그 off 면 모두 통과 = 기존 동작) ──
+        if self.config.long_only and sig.action != "LONG":
+            return None                                  # 롱 전용
+        if (self.config.macro_btc_ema_period > 0
+                and sig.action == "LONG"
+                and not self._btc_risk_on(ts)):
+            return None                                  # BTC risk-off → 신규 롱 금지
+        if not self._passes_volume_confirm(closed):
+            return None                                  # 거래량 동반 미충족
+
         # B-6: 진입 체결 모델(post_only 기본). 미체결이면 스킵(라이브 정합).
         filled, entry_price = self._resolve_entry_fill(symbol, ts, sig.action)
         if not filled:
@@ -671,16 +799,8 @@ class BacktestEngine:
             return None
 
         pair_tier = PAIR_TIERS.get(symbol, 2)
-        sizing = self.sizer.calculate(
-            capital=equity,
-            win_rate=_DEFAULT_BACKTEST_WIN_RATE,
-            avg_win_R=_DEFAULT_BACKTEST_WIN_R,
-            avg_loss_R=_DEFAULT_BACKTEST_LOSS_R,
-            regime=regime_state.regime,
-            confidence=regime_state.confidence,
-            sample_count=0,
-        )
-        if sizing.size_usdt <= 0:
+        size_usdt = self._size_position(equity, entry_price, sl_price, regime_state)
+        if size_usdt <= 0:
             return None
 
         return Signal(
@@ -695,7 +815,7 @@ class BacktestEngine:
             sl_price=sl_price,
             atr=atr,
             pair_tier=pair_tier,
-            size_usdt=sizing.size_usdt,
+            size_usdt=size_usdt,
         )
 
     # ── 거래 시뮬레이션 (단계 4·5) ──
@@ -1007,6 +1127,7 @@ class BacktestEngine:
             setup_stats=setup_stats,
             equity_curve=equity_curve,
             drawdown_curve=drawdown_curve,
+            trades=trades,
         )
 
     # ── 통계 헬퍼 ──
