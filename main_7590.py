@@ -43,7 +43,16 @@ try:
 except ImportError:  # python-dotenv 미설치 — .env 자동 로드 비활성화
     load_dotenv = None
 
-from analytics.expectancy import ExpectancyAnalyzer
+# v3.2.0 M15-fix: .env 를 config.settings import *전에* 로드한다.
+# config/settings.py 는 import 시점에 ACTIVE_STRATEGY / LIVE_PROBE_BUDGET_USDT /
+# PROTECTED_SYMBOLS 를 os.environ 에서 읽는다. main() 의 load_dotenv() 만으로는
+# 이미 굳어진 STRATEGY_CONFIG 를 되돌릴 수 없어 ACTIVE_STRATEGY=daily_tsmom 가
+# 무시되는 버그가 있었다(2026-05-29 실측: oi_surge 로 가동). 프로젝트 모듈 import
+# 보다 먼저 .env 를 환경에 올린다 (멱등 — main() 의 재호출은 무해).
+if load_dotenv is not None:
+    load_dotenv()
+
+from analytics.expectancy import ExpectancyAnalyzer  # noqa: E402
 from analytics.macro_event_analyzer import MacroEventAnalyzer
 from analytics.shadow_mode import ShadowRecorder
 

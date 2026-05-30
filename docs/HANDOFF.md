@@ -1,6 +1,16 @@
 # Binance Futures Bot — 세션 연속성 핸드오프 (컨텍스트 초기화 후 재개용)
 
-> 최종 갱신: 2026-05-28 (**M15 — 라이브 1d DailyTSMOM + shadow 공유게이트 통합**)
+> 최종 갱신: 2026-05-29 (**M15-fix — .env load 순서 버그 + IP 밴 진단**)
+>
+> 🔧 **M15-fix (2026-05-29)**: Paper 재가동 실측 중 발견한 *치명적 버그* 수정.
+> - **증상**: `.env` 에 `ACTIVE_STRATEGY=daily_tsmom` 설정했는데도 봇이 **oi_surge(9개 실패전략 중 하나)로 가동**. 로그에 `[OIScanner] 12 페어 → 후보 0` 30초마다 반복, shadow 0회.
+> - **근본원인**: main_7590 이 `load_dotenv()` 를 `main()`(=`config.settings` import *이후*)에서 호출 → `STRATEGY_CONFIG` 가 import 시점에 `.env` 의 ACTIVE_STRATEGY 를 못 보고 기본값 oi_surge 로 굳음. settings 는 import 시점에 env 3곳(ACTIVE_STRATEGY/LIVE_PROBE_BUDGET_USDT/PROTECTED_SYMBOLS) 읽음.
+> - **수정**: `load_dotenv()` 를 모듈 최상단(프로젝트 import 전)으로 이동 → 3곳 일괄 해결.
+> - **재발방지**: `tests/test_main_dotenv_order.py` (subprocess 로 import 순서 재현, 3 테스트).
+> - **부수 발견 (IP 밴)**: testnet `APIError(-1003)` IP 밴 — 단, **여러 봇 동시 실행**(검증 인스턴스 다수) 탓. 단일 봇은 분당 ~34요청 ≪ 6000 한도라 재발 X. ~3분 단기 밴 자동 해제됨.
+> - **운영자 재가동**: 봇 다 멈춤 상태. `python main_7590.py --dry-run --duration N` 재실행 시 이제 daily_tsmom 로 가동.
+
+> 옛 갱신: 2026-05-28 (**M15 — 라이브 1d DailyTSMOM + shadow 공유게이트 통합**)
 >
 > 🔧 **M15 (2026-05-28)**: Paper 1차 가동(11.5h) 분석 중 *3개 구조적 단절* 발견 → 수정.
 > - **단절1**: 라이브 루프에 1d 전략 부재 (oi_surge/breakout 1h 둘 다 실패전략). DailyTSMOM 라이브 미연결
