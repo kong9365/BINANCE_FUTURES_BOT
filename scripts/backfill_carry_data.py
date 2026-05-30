@@ -155,6 +155,8 @@ def main():
     ap.add_argument("--max-syms", type=int, default=8)
     ap.add_argument("--start", default="2023-01-01")
     ap.add_argument("--report-only", action="store_true")
+    ap.add_argument("--universe-all", action="store_true",
+                    help="모든 perp 심볼(유동 우선) 수집 — D-2 데이터 확장(spot 없는 종목은 자동 스킵)")
     args = ap.parse_args()
 
     perp_syms = [os.path.basename(p).replace("_1d.parquet", "")
@@ -163,9 +165,13 @@ def main():
     # 보호종목 BTC/ETH 는 *데이터*만(거래 유니버스 제외). mid-liq 포함해 대표성 확보.
     _liquid = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT",
                "DOGEUSDT", "LINKUSDT", "AVAXUSDT", "LTCUSDT", "TRXUSDT", "BCHUSDT"]
-    sample = [s for s in _liquid if s in perp_syms][:args.max_syms]
-    if not sample:
-        sample = perp_syms[:args.max_syms]
+    if args.universe_all:
+        rest = [s for s in perp_syms if s not in _liquid]
+        sample = ([s for s in _liquid if s in perp_syms] + rest)[:args.max_syms]
+    else:
+        sample = [s for s in _liquid if s in perp_syms][:args.max_syms]
+        if not sample:
+            sample = perp_syms[:args.max_syms]
 
     print(f"Phase D-1 — 공개 시장데이터 백필 (키 없음, 계좌·주문 0). 샘플 {len(sample)}종목, 1d, {args.start}~")
     if not args.report_only:
