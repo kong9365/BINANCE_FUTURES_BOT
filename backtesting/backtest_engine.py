@@ -125,6 +125,15 @@ class BacktestConfig:
     slippage_tier_2: float = 0.00100
     slippage_tier_3: float = 0.00150
 
+    # B-6 [B-3]: 진입 체결 모델 — 라이브(GTX post-only)와 백테스트를 같은 게임으로.
+    #   "post_only" (기본·라이브 일치): 신호봉 종가(close[ts-1])에 resting LIMIT.
+    #       진입봉 ts 가 그 가격에 닿으면(롱 low≤limit / 숏 high≥limit) limit 에 체결
+    #       (maker, 무슬리피지). 안 닿으면 미체결→스킵. ⚠ 봉≫15초라 체결률 *상한*
+    #       추정(방향 판단용, 정밀 캘리브레이션은 B-8 testnet).
+    #   "taker": 봉 ts open 확정 체결 + taker 수수료 + 양측 슬리피지 (D-1 프리뷰).
+    #   "maker_open": 기존 가정(봉 ts open 확정 체결 + maker 진입). 비교 보존용 (legacy).
+    entry_fill_model: str = "post_only"
+
     # 백테스트 시 펀딩비 적용 여부
     apply_funding: bool = True
 
@@ -434,6 +443,45 @@ class BacktestEngine:
         return float(sub.iloc[-1])
 
     # ── 시그널 평가 (단계 2·3) ──
+    def _resolve_entry_fill(
+        self, symbol: str, ts: Any, action: str,
+    ) -> Tuple[bool, Optional[float]]:
+        """B-6 [B-3]: 진입 체결 모델에 따라 (체결여부, 체결가)를 반환한다.
+
+        - maker_open/taker: 봉 ts 의 open 에 확정 체결 (체결률 100%).
+        - post_only: 신호봉 종가(직전 마감봉 close = close[ts-1] = 라이브 주문가)에
+          resting LIMIT. 진입봉 ts 가 그 가격에 닿으면(롱 low≤limit / 숏 high≥limit)
+          limit 에 체결, 안 닿으면 미체결(False)→스킵. ⚠ 봉(1d/1h)≫라이브 15초라
+          봉 내 저점이 거의 항상 limit 을 터치 → 체결률 *상한*(over-fill) 추정.
+        - post_only_strict: *하한* — 시초가(open[ts])가 limit 너머로 갭하면 미체결
+          (롱 open>limit / 숏 open<limit). 갭으로 달아난 진입을 더 보수적으로 배제.
+          ⚠ 연속(24/7) 크립토는 open[ts]≈close[ts-1] 라 상·하한 모두 봉 granularity
+          한계가 있다. 정밀 체결률은 B-8(testnet 실체결)에서만 측정 가능.
+        """
+        df = self._candles_by_pair[symbol]
+        if ts not in df.index:
+            return False, None
+        model = self.config.entry_fill_model
+        if model in ("maker_open", "taker"):
+            ep = float(df.at[ts, "open"])
+            return (ep > 0), (ep if ep > 0 else None)
+        # post_only / post_only_strict — 직전 마감봉 종가에 resting LIMIT
+        pos = df.index.get_loc(ts)
+        if pos <= 0:                       # 직전 마감봉 없음 → 주문가 미정 → 스킵
+            return False, None
+        limit = float(df.iloc[pos - 1]["close"])   # close[ts-1]
+        if limit <= 0:
+            return False, None
+        if model == "post_only_strict":
+            # 하한: 시초가가 limit 너머로 갭하면 미체결(달리는 진입 배제)
+            op = float(df.at[ts, "open"])
+            filled = (op <= limit) if action == "LONG" else (op >= limit)
+        elif action == "LONG":
+            filled = float(df.at[ts, "low"]) <= limit
+        else:  # SHORT
+            filled = float(df.at[ts, "high"]) >= limit
+        return (filled, limit if filled else None)
+
     def _evaluate_signal(
         self,
         symbol: str,
@@ -468,13 +516,9 @@ class BacktestEngine:
         if atr <= 0:
             return None
 
-        # 진입 체결가 = 봉 ts 의 open (봉 시작 시점에 알 수 있는 값 — 룩어헤드 아님).
-        # 봉 ts 의 high/low/close 는 여기서 절대 읽지 않는다.
-        df = self._candles_by_pair[symbol]
-        if ts not in df.index:
-            return None
-        entry_price = float(df.at[ts, "open"])
-        if entry_price <= 0:
+        # B-6: 진입 체결 모델(post_only 기본). 미체결이면 스킵(라이브 정합).
+        filled, entry_price = self._resolve_entry_fill(symbol, ts, action)
+        if not filled:
             return None
 
         if action == "LONG":
@@ -555,10 +599,9 @@ class BacktestEngine:
         atr = self._calc_atr(self._get_candles_until(symbol, "1h", ts), ATR_PERIOD)
         if atr <= 0:
             return None
-        if ts not in df.index:
-            return None
-        entry_price = float(df.at[ts, "open"])
-        if entry_price <= 0:
+        # B-6: 진입 체결 모델(post_only 기본). 미체결이면 스킵(라이브 정합).
+        filled, entry_price = self._resolve_entry_fill(symbol, ts, action)
+        if not filled:
             return None
 
         if action == "LONG":
@@ -612,11 +655,9 @@ class BacktestEngine:
         if sig is None:
             return None
 
-        df = self._candles_by_pair[symbol]
-        if ts not in df.index:
-            return None
-        entry_price = float(df.at[ts, "open"])
-        if entry_price <= 0:
+        # B-6: 진입 체결 모델(post_only 기본). 미체결이면 스킵(라이브 정합).
+        filled, entry_price = self._resolve_entry_fill(symbol, ts, sig.action)
+        if not filled:
             return None
 
         atr = sig.atr
@@ -770,10 +811,23 @@ class BacktestEngine:
             gross_pct = (signal.entry_price - exit_price) / signal.entry_price
         gross_pnl = gross_pct * notional
 
-        # 비용: 진입 maker + 청산 taker + 양측 슬리피지 (§10-1 원칙 ①)
+        # 비용: 진입 체결 모델별 분기 (B-6, §10-1 원칙 ①). 청산은 항상 taker + 슬리피지.
+        #   post_only : 진입 maker + 슬리피지 0 (resting limit 체결) → maker+taker+1slip
+        #   maker_open: 진입 maker + 진입 슬리피지       (legacy)    → maker+taker+2slip
+        #   taker     : 진입 taker + 진입 슬리피지                    → taker+taker+2slip
         slip = self.config.slippage_for_tier(signal.pair_tier)
+        model = self.config.entry_fill_model
+        if model == "taker":
+            entry_fee_rate = self.config.taker_fee
+            entry_slip = slip
+        elif model in ("post_only", "post_only_strict"):
+            entry_fee_rate = self.config.maker_fee
+            entry_slip = 0.0
+        else:  # maker_open (legacy)
+            entry_fee_rate = self.config.maker_fee
+            entry_slip = slip
         fees = (
-            self.config.maker_fee + self.config.taker_fee + 2 * slip
+            entry_fee_rate + self.config.taker_fee + entry_slip + slip
         ) * notional
 
         pnl = gross_pnl - fees - funding_total

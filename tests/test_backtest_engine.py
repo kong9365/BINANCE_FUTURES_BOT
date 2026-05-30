@@ -282,3 +282,102 @@ def test_scenario_4b_prefix_invariance_no_lookahead():
             f"룩어헤드 의심: {ts} 시점 자본이 미래 데이터 유무에 따라 달라짐 "
             f"(full={full_eq[ts]}, prefix={prefix_eq[ts]})"
         )
+
+
+# =====================================================================
+# B-6 [B-3] — 진입 체결 모델 (post_only / taker / maker_open)
+# 조건①: ts=진입봉, limit=close[ts-1](신호봉 종가) 핀.
+# 조건②: post_only 진입가 = limit(≠open[ts]), maker, 무슬리피지.
+# =====================================================================
+
+TS_ENTRY = TS0 + INTERVAL   # 진입봉 ts (pos 1; pos 0 = 신호봉)
+
+
+def _two_bar_df(prev_close, o, h, l, c):
+    """bar0=신호봉(close=prev_close), bar1=진입봉 ts(OHLC 명시)."""
+    idx = pd.DatetimeIndex([TS0, TS_ENTRY])
+    rows = [
+        (prev_close, prev_close, prev_close, prev_close, 1000.0, 0.0),
+        (o, h, l, c, 1000.0, 0.0),
+    ]
+    return pd.DataFrame(
+        rows, index=idx,
+        columns=["open", "high", "low", "close", "volume", "funding_rate"],
+    )
+
+
+def _engine_with(df, model):
+    eng = BacktestEngine(BacktestConfig(pairs=["X"], entry_fill_model=model))
+    eng._candles_by_pair = {"X": df}
+    return eng
+
+
+def test_b6_post_only_limit_is_prev_close_and_entry_is_limit():
+    """조건①②: limit=close[ts-1]=100, 진입봉이 닿으면 체결가=limit(open 101 아님)."""
+    df = _two_bar_df(prev_close=100.0, o=101.0, h=102.0, l=99.5, c=101.0)  # 갭업이나 저점이 limit 터치
+    filled, entry = _engine_with(df, "post_only")._resolve_entry_fill("X", TS_ENTRY, "LONG")
+    assert filled is True
+    assert entry == 100.0          # = close[ts-1] (라이브 주문가), open[ts]=101 아님
+
+
+def test_b6_post_only_no_fill_on_gap_away_long():
+    """B-3 핵심: 롱이 갭업으로 달아나 저점이 limit 위 → 미체결(승자 놓침)."""
+    df = _two_bar_df(prev_close=100.0, o=102.0, h=103.0, l=101.0, c=102.0)  # low 101 > limit 100
+    filled, entry = _engine_with(df, "post_only")._resolve_entry_fill("X", TS_ENTRY, "LONG")
+    assert filled is False
+    assert entry is None
+
+
+def test_b6_post_only_boundary_low_eq_limit_fills():
+    """경계: low[ts] == limit → 체결(≤)."""
+    df = _two_bar_df(prev_close=100.0, o=101.0, h=102.0, l=100.0, c=101.0)
+    filled, entry = _engine_with(df, "post_only")._resolve_entry_fill("X", TS_ENTRY, "LONG")
+    assert filled is True and entry == 100.0
+
+
+def test_b6_post_only_short_symmetry():
+    """숏 대칭: high≥limit 체결 / 갭다운으로 high<limit 미체결."""
+    fill_df = _two_bar_df(prev_close=100.0, o=99.0, h=100.5, l=98.0, c=99.0)   # high 100.5 ≥ 100
+    f1, e1 = _engine_with(fill_df, "post_only")._resolve_entry_fill("X", TS_ENTRY, "SHORT")
+    assert f1 is True and e1 == 100.0
+    gap_df = _two_bar_df(prev_close=100.0, o=98.0, h=99.0, l=97.0, c=98.0)     # high 99 < 100
+    f2, e2 = _engine_with(gap_df, "post_only")._resolve_entry_fill("X", TS_ENTRY, "SHORT")
+    assert f2 is False and e2 is None
+
+
+def test_b6_maker_open_legacy_always_fills_at_open():
+    """legacy: 저점이 limit 위든 아니든 봉 open 에 확정 체결."""
+    df = _two_bar_df(prev_close=100.0, o=105.0, h=106.0, l=104.0, c=105.0)
+    filled, entry = _engine_with(df, "maker_open")._resolve_entry_fill("X", TS_ENTRY, "LONG")
+    assert filled is True and entry == 105.0    # open[ts], 체결 무조건
+
+
+def test_b6_taker_fills_at_open():
+    """taker: 봉 open 확정 체결(maker_open 과 동일 가격, 수수료만 다름)."""
+    df = _two_bar_df(prev_close=100.0, o=105.0, h=106.0, l=104.0, c=105.0)
+    filled, entry = _engine_with(df, "taker")._resolve_entry_fill("X", TS_ENTRY, "LONG")
+    assert filled is True and entry == 105.0
+
+
+def test_b6_post_only_first_bar_no_prev_close_skips():
+    """엣지: 진입봉이 첫 봉(직전 마감봉 없음) → 주문가 미정 → 미체결."""
+    df = _two_bar_df(prev_close=100.0, o=99.0, h=100.0, l=98.0, c=99.0)
+    filled, entry = _engine_with(df, "post_only")._resolve_entry_fill("X", TS0, "LONG")
+    assert filled is False and entry is None
+
+
+def test_b6_post_only_default_model():
+    """기본값이 라이브 일치(post_only)인지 — config default 핀."""
+    assert BacktestConfig(pairs=["X"]).entry_fill_model == "post_only"
+
+
+def test_b6_post_only_strict_skips_on_open_gap_up():
+    """post_only_strict(하한): 시초가가 limit 위로 갭하면 미체결(달리는 진입 배제)."""
+    # open 101 > limit 100 → 미체결 (low 가 limit 을 터치해도 strict 는 시초가 기준)
+    df = _two_bar_df(prev_close=100.0, o=101.0, h=102.0, l=99.0, c=101.5)
+    filled, entry = _engine_with(df, "post_only_strict")._resolve_entry_fill("X", TS_ENTRY, "LONG")
+    assert filled is False and entry is None
+    # open 99.5 ≤ limit 100 → 체결 at limit
+    df2 = _two_bar_df(prev_close=100.0, o=99.5, h=101.0, l=99.0, c=100.5)
+    f2, e2 = _engine_with(df2, "post_only_strict")._resolve_entry_fill("X", TS_ENTRY, "LONG")
+    assert f2 is True and e2 == 100.0
