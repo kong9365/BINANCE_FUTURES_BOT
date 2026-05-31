@@ -796,10 +796,16 @@ class BacktestEngine:
         # ── Phase C 게이트 (config 플래그 off 면 모두 통과 = 기존 동작) ──
         if self.config.long_only and sig.action != "LONG":
             return None                                  # 롱 전용
-        if (self.config.macro_btc_ema_period > 0
-                and sig.action == "LONG"
-                and not self._btc_risk_on(ts)):
-            return None                                  # BTC risk-off → 신규 롱 금지
+        # 매크로 게이트(symmetric): macro_btc_ema_period>0 일 때
+        #   LONG  = BTC risk-on(close>200EMA, BTC_RISK_OFF==OFF) 일 때만
+        #   SHORT = BTC risk-off(close≤200EMA, BTC_RISK_OFF==ON) 일 때만
+        # long_only=True 면 SHORT 는 위에서 이미 차단 → Phase C 동작 불변(LONG 분기 동일).
+        if self.config.macro_btc_ema_period > 0:
+            risk_on = self._btc_risk_on(ts)
+            if sig.action == "LONG" and not risk_on:
+                return None                              # BTC risk-off → 신규 롱 금지
+            if sig.action == "SHORT" and risk_on:
+                return None                              # BTC risk-on → 신규 숏 금지
         if not self._passes_volume_confirm(closed):
             return None                                  # 거래량 동반 미충족
 
