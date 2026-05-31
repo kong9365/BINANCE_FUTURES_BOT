@@ -50,7 +50,9 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 
 from sizing.dynamic_sizer import DynamicPositionSizer
-from strategy.breakout import BreakoutConfig, ema, evaluate_breakout
+from strategy.breakout import (
+    BreakoutConfig, ema, evaluate_breakout, rolling_return_sign, rsi_wilder, sma,
+)
 from strategy.smc import SMCConfig, evaluate_smc
 from strategy.cost_guard import CostGuard
 from strategy.regime_detector import Regime, RegimeDetector
@@ -122,6 +124,10 @@ class BacktestConfig:
     breakout_trail_exit: bool = False
     breakout_trail_atr_mult: float = 3.0       # 트레일 = 최고가 − N·ATR (LONG)
 
+    # MA-교차 청산(opt-in, 기본 0=off → 기존 전략/테스트 전부 불변). >0 이면 보유 중
+    # 종가가 SMA(exit_ma_period) 반대편으로 교차할 때 청산(MA_EXIT). 저회전 추세(Faber)용.
+    exit_ma_period: int = 0
+
     # 최대 보유 봉 수(시간 스톱). 돌파처럼 추세추종은 길게 끌 수 있어 설정화.
     time_stop_bars: int = DEFAULT_TIME_STOP_BARS
 
@@ -161,6 +167,26 @@ class BacktestConfig:
     smc_poi_lookback: int = 10                 # FVG/OB(point-of-interest) 신선도 윈도우
     smc_atr_period: int = 14
     smc_sl_atr_buffer: float = 0.1             # SL = sweep 극값 ∓ 0.1·ATR
+
+    # ── 새 가설 후보 (검증 전용. 각 strategy 평가기에서만 사용. 사전확정 단일값) ──
+    # faber: 저회전 추세 — close vs SMA(N). 청산은 MA-교차(러너가 exit_ma_period 설정),
+    #   재난 SL = 진입 ∓ stop·ATR(R 분모용), TP 는 센티넬(곱셈)로 사실상 무발화.
+    faber_sma_period: int = 200
+    faber_atr_period: int = 14
+    faber_atr_stop_mult: float = 3.0
+    # tsmom_ens: 1/3/6개월 수익 부호 앙상블. 월 보유(러너 time_stop)+ATR SL(변동성타겟).
+    tsmom_lookbacks: tuple = (21, 63, 126)
+    tsmom_atr_period: int = 14
+    tsmom_atr_stop_mult: float = 3.0
+    tsmom_atr_target_mult: float = 6.0
+    # mean_rev: SMA(200) 추세필터 하 RSI(2) 과매도/과매수 → 고정 TP(평균복귀)+SL.
+    meanrev_sma_period: int = 200
+    meanrev_rsi_period: int = 2
+    meanrev_rsi_long_below: float = 5.0
+    meanrev_rsi_short_above: float = 95.0
+    meanrev_atr_period: int = 14
+    meanrev_atr_tp_mult: float = 1.0
+    meanrev_atr_stop_mult: float = 2.0
 
     # 백테스트 시 펀딩비 적용 여부
     apply_funding: bool = True
@@ -638,6 +664,12 @@ class BacktestEngine:
             return self._evaluate_breakout(symbol, ts, regime_state, equity)
         if self.config.strategy == "smc":
             return self._evaluate_smc(symbol, ts, regime_state, equity)
+        if self.config.strategy == "faber":
+            return self._evaluate_faber(symbol, ts, regime_state, equity)
+        if self.config.strategy == "tsmom_ens":
+            return self._evaluate_tsmom_ens(symbol, ts, regime_state, equity)
+        if self.config.strategy == "mean_rev":
+            return self._evaluate_mean_rev(symbol, ts, regime_state, equity)
 
         if regime_state.regime == Regime.TREND_UP:
             action = "LONG"
@@ -894,6 +926,143 @@ class BacktestEngine:
             size_usdt=size_usdt,
         )
 
+    def _evaluate_faber(
+        self, symbol: str, ts: Any, regime_state, equity: float
+    ) -> Optional[Signal]:
+        """저회전 추세(Faber) — 마감봉 종가 vs SMA(N) 방향. 청산은 MA-교차
+        (러너가 exit_ma_period=faber_sma_period 설정). 재난 SL = 진입 ∓ stop·ATR(R 분모),
+        TP 는 곱셈 센티넬로 사실상 무발화. 룩어헤드 0(ts 이전 마감봉만).
+        """
+        cfg = self.config
+        closed = self._get_candles_until(symbol, "1d", ts)
+        closes = [c[3] for c in closed]
+        ma = sma(closes, cfg.faber_sma_period)
+        if ma is None:
+            return None
+        last_close = closes[-1]
+        if last_close > ma:
+            action = "LONG"
+        elif last_close < ma:
+            action = "SHORT"
+        else:
+            return None
+        if cfg.long_only and action != "LONG":
+            return None
+        atr = self._calc_atr(closed, cfg.faber_atr_period)
+        if atr <= 0:
+            return None
+        filled, entry_price = self._resolve_entry_fill(symbol, ts, action)
+        if not filled:
+            return None
+        if action == "LONG":
+            sl_price = entry_price - cfg.faber_atr_stop_mult * atr
+            tp_price = entry_price * 1000.0          # 센티넬: 1봉이 ×1000 불가 → 무발화
+        else:
+            sl_price = entry_price + cfg.faber_atr_stop_mult * atr
+            tp_price = entry_price / 1000.0
+        if sl_price <= 0 or tp_price <= 0:
+            return None
+        size_usdt = self._size_position(equity, entry_price, sl_price, regime_state)
+        if size_usdt <= 0:
+            return None
+        return Signal(
+            symbol=symbol, action=action, setup_tag=f"faber_{action.lower()}",
+            regime=regime_state.regime, confidence=regime_state.confidence,
+            entry_ts=ts, entry_price=entry_price, tp_price=tp_price, sl_price=sl_price,
+            atr=atr, pair_tier=PAIR_TIERS.get(symbol, 2), size_usdt=size_usdt,
+        )
+
+    def _evaluate_tsmom_ens(
+        self, symbol: str, ts: Any, regime_state, equity: float
+    ) -> Optional[Signal]:
+        """TSMOM 앙상블 — 1/3/6개월 수익 부호 합(>0 LONG/<0 SHORT). 월 보유(러너
+        time_stop≈21)+ATR SL. risk_per_trade_pct+ATR-stop = 변동성 타겟(notional∝1/ATR).
+        룩어헤드 0.
+        """
+        cfg = self.config
+        closed = self._get_candles_until(symbol, "1d", ts)
+        closes = [c[3] for c in closed]
+        if len(closes) < max(cfg.tsmom_lookbacks) + 1:
+            return None
+        net = sum(rolling_return_sign(closes, lb) for lb in cfg.tsmom_lookbacks)
+        if net > 0:
+            action = "LONG"
+        elif net < 0:
+            action = "SHORT"
+        else:
+            return None
+        if cfg.long_only and action != "LONG":
+            return None
+        atr = self._calc_atr(closed, cfg.tsmom_atr_period)
+        if atr <= 0:
+            return None
+        filled, entry_price = self._resolve_entry_fill(symbol, ts, action)
+        if not filled:
+            return None
+        if action == "LONG":
+            sl_price = entry_price - cfg.tsmom_atr_stop_mult * atr
+            tp_price = entry_price + cfg.tsmom_atr_target_mult * atr
+        else:
+            sl_price = entry_price + cfg.tsmom_atr_stop_mult * atr
+            tp_price = entry_price - cfg.tsmom_atr_target_mult * atr
+        if sl_price <= 0 or tp_price <= 0:
+            return None
+        size_usdt = self._size_position(equity, entry_price, sl_price, regime_state)
+        if size_usdt <= 0:
+            return None
+        return Signal(
+            symbol=symbol, action=action, setup_tag=f"tsmom_ens_{action.lower()}",
+            regime=regime_state.regime, confidence=regime_state.confidence,
+            entry_ts=ts, entry_price=entry_price, tp_price=tp_price, sl_price=sl_price,
+            atr=atr, pair_tier=PAIR_TIERS.get(symbol, 2), size_usdt=size_usdt,
+        )
+
+    def _evaluate_mean_rev(
+        self, symbol: str, ts: Any, regime_state, equity: float
+    ) -> Optional[Signal]:
+        """단기 평균회귀(Connors) — SMA(200) 추세필터 하 RSI(2) 과매도(롱)/과매수(숏).
+        고정 TP(진입 ± tp·ATR = 평균복귀 목표) + SL + 짧은 time_stop(러너). 룩어헤드 0.
+        """
+        cfg = self.config
+        closed = self._get_candles_until(symbol, "1d", ts)
+        closes = [c[3] for c in closed]
+        ma = sma(closes, cfg.meanrev_sma_period)
+        r = rsi_wilder(closes, cfg.meanrev_rsi_period)
+        if ma is None or r is None:
+            return None
+        last_close = closes[-1]
+        if last_close > ma and r < cfg.meanrev_rsi_long_below:
+            action = "LONG"
+        elif last_close < ma and r > cfg.meanrev_rsi_short_above:
+            action = "SHORT"
+        else:
+            return None
+        if cfg.long_only and action != "LONG":
+            return None
+        atr = self._calc_atr(closed, cfg.meanrev_atr_period)
+        if atr <= 0:
+            return None
+        filled, entry_price = self._resolve_entry_fill(symbol, ts, action)
+        if not filled:
+            return None
+        if action == "LONG":
+            tp_price = entry_price + cfg.meanrev_atr_tp_mult * atr
+            sl_price = entry_price - cfg.meanrev_atr_stop_mult * atr
+        else:
+            tp_price = entry_price - cfg.meanrev_atr_tp_mult * atr
+            sl_price = entry_price + cfg.meanrev_atr_stop_mult * atr
+        if sl_price <= 0 or tp_price <= 0:
+            return None
+        size_usdt = self._size_position(equity, entry_price, sl_price, regime_state)
+        if size_usdt <= 0:
+            return None
+        return Signal(
+            symbol=symbol, action=action, setup_tag=f"mean_rev_{action.lower()}",
+            regime=regime_state.regime, confidence=regime_state.confidence,
+            entry_ts=ts, entry_price=entry_price, tp_price=tp_price, sl_price=sl_price,
+            atr=atr, pair_tier=PAIR_TIERS.get(symbol, 2), size_usdt=size_usdt,
+        )
+
     # ── 거래 시뮬레이션 (단계 4·5) ──
     def _simulate_trade(self, signal: Signal) -> Optional[Trade]:
         """진입봉 ts 부터 순방향 스캔하여 TP/SL/시간스톱/데이터끝 청산을 결정.
@@ -935,6 +1104,16 @@ class BacktestEngine:
         trail_mult = self.config.breakout_trail_atr_mult
         trail_stop = signal.sl_price
         extreme = signal.entry_price
+
+        # MA-교차 청산(opt-in): SMA 시리즈 1회 precompute. 룩어헤드 0 —
+        # ma_series.iloc[pos] 는 close[..pos] 만으로 계산된 값(미래 봉 미참조).
+        ma_on = self.config.exit_ma_period > 0
+        ma_series = (
+            df["close"].rolling(
+                self.config.exit_ma_period, min_periods=self.config.exit_ma_period
+            ).mean()
+            if ma_on else None
+        )
 
         for pos in range(start_pos, len(idx_list)):
             ts = idx_list[pos]
@@ -985,6 +1164,16 @@ class BacktestEngine:
                         break
                     if low <= signal.tp_price:
                         exit_price, exit_reason, exit_ts = signal.tp_price, "TP", ts
+                        break
+
+            # MA-교차 청산(opt-in) — SL/TP/TRAIL 뒤·시간스톱 앞(재난 SL 우선 보존).
+            # 보유 중 종가가 SMA 반대편으로 교차 시 봉 종가로 청산(MA_EXIT). 1봉 granularity.
+            if ma_on:
+                ma_val = ma_series.iloc[pos]
+                if ma_val == ma_val:           # NaN(워밍업) 아님
+                    crossed = (close < ma_val) if signal.action == "LONG" else (close > ma_val)
+                    if crossed:
+                        exit_price, exit_reason, exit_ts = close, "MA_EXIT", ts
                         break
 
             # 시간 스톱 (config.time_stop_bars, 기본 DEFAULT_TIME_STOP_BARS)

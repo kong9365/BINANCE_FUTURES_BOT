@@ -168,6 +168,55 @@ def donchian(highs: Sequence[float], lows: Sequence[float],
     return max(window_high), min(window_low)
 
 
+def sma(values: Sequence[float], period: int) -> Optional[float]:
+    """마지막 단순이동평균(직전 period봉 종가 평균). 부족 시 None."""
+    if period <= 0 or len(values) < period:
+        return None
+    return sum(values[-period:]) / period
+
+
+def rolling_return_sign(closes: Sequence[float], lookback: int) -> int:
+    """closes[-1] 대비 lookback봉 전 수익률 부호: +1(상승)/-1(하락)/0(무변·부족).
+
+    TSMOM(time-series momentum) 다중 기간 앙상블의 단위 신호.
+    """
+    if lookback <= 0 or len(closes) < lookback + 1:
+        return 0
+    prev = closes[-1 - lookback]
+    if prev <= 0:
+        return 0
+    r = closes[-1] / prev - 1.0
+    return 1 if r > 0 else (-1 if r < 0 else 0)
+
+
+def rsi_wilder(closes: Sequence[float], period: int) -> Optional[float]:
+    """마지막 RSI(Wilder) ∈ [0,100]. period+1봉 미만이면 None.
+
+    indicators.rsi(pandas) 와 *수치 일치*: ewm(alpha=1/period, adjust=False) 와 동일하게
+    첫 델타로 시드 후 재귀 평활(고전 SMA-시드 아님). avg_loss==0 시 RSI=100(상승만)/50(무변).
+    순수 리스트판(평가기는 List[tuple] 소비) — parity 테스트로 드리프트 차단(§4).
+    """
+    n = len(closes)
+    if period <= 0 or n < period + 1:
+        return None
+    alpha = 1.0 / period
+    ag: Optional[float] = None
+    al = 0.0
+    for i in range(1, n):
+        d = closes[i] - closes[i - 1]
+        g = d if d > 0 else 0.0
+        loss = -d if d < 0 else 0.0
+        if ag is None:                       # 첫 델타 시드 (adjust=False)
+            ag, al = g, loss
+        else:
+            ag = (1 - alpha) * ag + alpha * g
+            al = (1 - alpha) * al + alpha * loss
+    if al == 0:
+        return 100.0 if (ag or 0.0) > 0 else 50.0
+    rs = ag / al
+    return 100.0 - 100.0 / (1.0 + rs)
+
+
 # ─────────────────────────────────────────────────────
 # 신호 평가
 # ─────────────────────────────────────────────────────
