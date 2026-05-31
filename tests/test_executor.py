@@ -1339,3 +1339,41 @@ async def test_p2_no_budget_cap_no_ceiling(db_path, mock_binance):
     ex = TradeExecutor(mock_binance, db_path, dry_run=False)
     result = await ex.enter_trade(_decision(size_usdt=500.0))  # budget_cap 미지정 → None
     assert result["success"] is True          # 하드실링 없음
+
+
+# =====================================================================
+# P3 — B-3 계측: 요청 limit가 + 주문 전송 시각 기록 (fail-soft)
+# =====================================================================
+
+
+async def test_p3_filled_records_limit_price_and_send_ts(db_path, mock_binance):
+    """체결 → trades 에 entry_limit_price(=요청 limit) + entry_order_send_ts 기록."""
+    mock_binance.futures_exchange_info.return_value = _exinfo()
+    mock_binance.futures_create_order.return_value = {"orderId": 111}
+    mock_binance.futures_create_algo_order.side_effect = [
+        {"algoId": 222, "clientAlgoId": "x"}, {"algoId": 333, "clientAlgoId": "y"},
+    ]
+    mock_binance.futures_get_order.return_value = {
+        "status": "FILLED", "executedQty": "0.5", "avgPrice": "100.0",
+    }
+    ex = TradeExecutor(mock_binance, db_path, dry_run=False)
+    result = await ex.enter_trade(_decision())
+    assert result["success"] is True
+    rows = _fetch_trades(db_path)
+    assert len(rows) == 1
+    assert rows[0]["entry_limit_price"] == 100.0          # norm_price(entry 100, tick 0.01)
+    assert rows[0]["entry_order_send_ts"] is not None
+
+
+async def test_p3_unfilled_records_send_ts(db_path, mock_binance):
+    """미체결 → unfilled_signals 에 order_send_ts 기록."""
+    mock_binance.futures_exchange_info.return_value = _exinfo()
+    mock_binance.futures_create_order.return_value = {"orderId": 111}
+    mock_binance.futures_get_order.return_value = {"status": "NEW", "executedQty": "0"}
+    ex = TradeExecutor(mock_binance, db_path, dry_run=False,
+                       fill_timeout_s=0.05, fill_poll_interval_s=0.01)
+    result = await ex.enter_trade(_decision())
+    assert result["success"] is False
+    rows = _fetch_unfilled(db_path)
+    assert len(rows) == 1
+    assert rows[0]["order_send_ts"] is not None

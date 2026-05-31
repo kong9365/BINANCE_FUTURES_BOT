@@ -53,3 +53,20 @@ def test_probe_state_single_row_check(tmp_path):
             conn.commit()
     finally:
         conn.close()
+
+
+def test_v3_2_5_b3_columns(tmp_path):
+    """v3.2.5: trades B-3 필드 + unfilled order_send_ts (additive, 멱등)."""
+    p = tmp_path / "bot.db"
+    init_db(p)
+    init_db(p)   # 멱등
+    conn = sqlite3.connect(p)
+    try:
+        tcols = {r[1] for r in conn.execute("PRAGMA table_info(trades)").fetchall()}
+        ucols = {r[1] for r in conn.execute("PRAGMA table_info(unfilled_signals)").fetchall()}
+        assert {"entry_limit_price", "entry_order_send_ts"} <= tcols
+        assert "order_send_ts" in ucols
+        vers = [r[0] for r in conn.execute("SELECT version FROM schema_migrations").fetchall()]
+        assert vers.count("v3.2.5") == 1
+    finally:
+        conn.close()

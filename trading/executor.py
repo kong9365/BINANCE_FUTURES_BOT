@@ -301,6 +301,12 @@ class TradeExecutor:
             return self._fail(symbol, decision, reason)
 
         # ── live: 진입 + FILLED 확인 (C2/H2) ──
+        # B-3 계측(fail-soft): 주문 전송 시각(근사 — leverage 설정 직전) + 요청 limit가(norm_price)를
+        # decision 에 기록(체결→trades / 미체결→unfilled_signals 공통 기준). 거래 흐름 무영향.
+        decision["entry_limit_price"] = norm_price
+        _order_send_ts = datetime.now(timezone.utc).isoformat()
+        decision["entry_order_send_ts"] = _order_send_ts
+        decision["order_send_ts"] = _order_send_ts
         client_order_id = self._gen_client_order_id(symbol)
         confirm = await self._place_entry_and_confirm(
             symbol, action, norm_qty, norm_price, leverage, client_order_id
@@ -977,9 +983,10 @@ class TradeExecutor:
                     manual_intervention, sizing_kelly_raw, sizing_pct,
                     wallet_balance_at_entry, available_at_entry,
                     locked_margin_at_entry,
-                    entry_order_id, sl_order_id, tp_order_id, trade_status
+                    entry_order_id, sl_order_id, tp_order_id, trade_status,
+                    entry_limit_price, entry_order_send_ts
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                          ?, ?, ?, ?)
+                          ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     now,
@@ -1005,6 +1012,8 @@ class TradeExecutor:
                     sl_order_id,
                     tp_order_id,
                     "OPEN",
+                    decision.get("entry_limit_price"),       # B-3: 요청 limit가
+                    decision.get("entry_order_send_ts"),     # B-3: 주문 전송 시각
                 ),
             )
             conn.commit()
@@ -1483,10 +1492,11 @@ class TradeExecutor:
             try:
                 conn.execute(
                     "INSERT INTO unfilled_signals "
-                    "(ts, symbol, action, setup_tag, signal_price, reason) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    "(ts, symbol, action, setup_tag, signal_price, reason, order_send_ts) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (ts, decision.get("symbol"), decision.get("action"),
-                     decision.get("setup_tag"), signal_price, reason),
+                     decision.get("setup_tag"), signal_price, reason,
+                     decision.get("order_send_ts")),
                 )
                 conn.commit()
             finally:
