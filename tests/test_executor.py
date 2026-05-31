@@ -1293,3 +1293,49 @@ async def test_s1_kill_dry_run_paper_unaffected(db_path, mock_binance, monkeypat
     ex = TradeExecutor(mock_binance, db_path, dry_run=True)
     result = await ex.enter_trade(_decision())
     assert result["success"] is True          # dry_run 페이퍼 기록 정상
+
+
+# =====================================================================
+# P2 — Probe 하드실링: size_usdt > budget_cap → 차단 (방어심층)
+# =====================================================================
+
+
+async def test_p2_size_exceeds_probe_budget_blocked(db_path, mock_binance):
+    """decision.budget_cap 존재 & size 초과 → 차단 + 실주문 0 + 행 없음."""
+    mock_binance.futures_exchange_info.return_value = _exinfo()
+    ex = TradeExecutor(mock_binance, db_path, dry_run=False)
+    result = await ex.enter_trade(_decision(size_usdt=50.0, budget_cap=40.0))
+    assert result["success"] is False
+    assert result["reason"] == "size_exceeds_probe_budget"
+    mock_binance.futures_create_order.assert_not_called()
+    assert _fetch_trades(db_path) == []
+
+
+async def test_p2_size_within_probe_budget_allowed(db_path, mock_binance):
+    """budget_cap 이내(==) → 정상 진입."""
+    mock_binance.futures_exchange_info.return_value = _exinfo()
+    mock_binance.futures_create_order.return_value = {"orderId": 111}
+    mock_binance.futures_create_algo_order.side_effect = [
+        {"algoId": 222, "clientAlgoId": "x"}, {"algoId": 333, "clientAlgoId": "y"},
+    ]
+    mock_binance.futures_get_order.return_value = {
+        "status": "FILLED", "executedQty": "0.5", "avgPrice": "100.0",
+    }
+    ex = TradeExecutor(mock_binance, db_path, dry_run=False)
+    result = await ex.enter_trade(_decision(size_usdt=50.0, budget_cap=50.0))
+    assert result["success"] is True
+
+
+async def test_p2_no_budget_cap_no_ceiling(db_path, mock_binance):
+    """대조군: budget_cap None(probe OFF) → 하드실링 미적용(기존 동작 불변)."""
+    mock_binance.futures_exchange_info.return_value = _exinfo()
+    mock_binance.futures_create_order.return_value = {"orderId": 111}
+    mock_binance.futures_create_algo_order.side_effect = [
+        {"algoId": 222, "clientAlgoId": "x"}, {"algoId": 333, "clientAlgoId": "y"},
+    ]
+    mock_binance.futures_get_order.return_value = {
+        "status": "FILLED", "executedQty": "5.0", "avgPrice": "100.0",
+    }
+    ex = TradeExecutor(mock_binance, db_path, dry_run=False)
+    result = await ex.enter_trade(_decision(size_usdt=500.0))  # budget_cap 미지정 → None
+    assert result["success"] is True          # 하드실링 없음

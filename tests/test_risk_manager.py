@@ -207,6 +207,21 @@ async def test_scenario_7_max_concurrent_positions(db_path):
     assert rm.get_max_concurrent_positions(19999) == 2
 
 
+def test_scenario_7b_probe_concurrent_relaxation(db_path, monkeypatch):
+    """★Probe 모드: get_max_concurrent = PROBE_CONFIG.max_concurrent(2) — $200서 1→2
+    게이트 완화(운영자 명시 승인). probe OFF 면 기존 자본별 한도(완화 0)."""
+    import trading.risk_manager as rmmod
+    rm = RiskManager(db_path=db_path, capital_manager=_make_cm())
+    # OFF(기본) — 기존 자본별
+    monkeypatch.setattr(rmmod.PROBE_CONFIG, "enabled", False)
+    assert rm.get_max_concurrent_positions(200) == 1
+    # ON — probe cap 2 ($200서 1→2 완화)
+    monkeypatch.setattr(rmmod.PROBE_CONFIG, "enabled", True)
+    monkeypatch.setattr(rmmod.PROBE_CONFIG, "max_concurrent", 2)
+    assert rm.get_max_concurrent_positions(200) == 2
+    assert rm.get_max_concurrent_positions(20000) == 2     # probe 모드는 자본 무관 cap
+
+
 # ── 시나리오 8: available < $100 → 차단 ─────────────────────────────
 
 async def test_scenario_8_min_balance_blocks(db_path):

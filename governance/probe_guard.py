@@ -101,3 +101,18 @@ def evaluate_probe_halt(
                 True, f"기간 경과(≥{cfg.max_weeks}주)", "probe_max_weeks", auto_stop=True)
 
     return ProbeHaltResult(False)
+
+
+def probe_size_usdt(entry: float, sl: float, budget_cap: float, risk_pct: float) -> float:
+    """결정적 0.5% risk notional (Kelly 우회 — 연승/win_rate 무관). budget_cap 상한.
+
+    notional = risk_pct * budget_cap * entry / |entry - sl|  (stop 도달 = 정확히 risk_pct 손실).
+    동일 입력 → 동일 출력(결정적). |거리|≈0 또는 비정상 입력 → 0.0(진입 차단).
+    """
+    if entry <= 0 or budget_cap <= 0 or risk_pct <= 0:
+        return 0.0
+    stop_dist = abs(entry - sl)
+    if stop_dist <= entry * 1e-9:        # zero-div 가드 (dynamic_sizer A1 과 동일 기준)
+        return 0.0
+    notional = risk_pct * budget_cap * entry / stop_dist
+    return min(notional, budget_cap)     # budget 초과 금지

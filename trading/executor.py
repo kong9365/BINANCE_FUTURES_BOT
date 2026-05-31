@@ -274,6 +274,16 @@ class TradeExecutor:
             logger.critical("[Executor] %s KillSwitch 활성 → 진입 차단 (S1 방어심층)", symbol)
             return self._fail(symbol, decision, "killswitch_active", critical=True)
 
+        # ── live: Probe 하드실링 (방어심층) — 메인루프 우회/버그에도 소액 보장 ──
+        # decision.budget_cap 존재(probe 모드) & size_usdt 가 예산 초과면 차단(게이트만).
+        _budget_cap = decision.get("budget_cap")
+        if _budget_cap is not None and size_usdt > float(_budget_cap) * 1.001:
+            logger.critical(
+                "[Executor] %s size $%.2f > probe budget $%.2f → 차단(하드실링)",
+                symbol, size_usdt, float(_budget_cap),
+            )
+            return self._fail(symbol, decision, "size_exceeds_probe_budget", critical=True)
+
         # ── live: Hedge Mode 차단 (A-4) ──
         # One-way Mode 전제. Hedge Mode 면 positionSide 누락/오매칭 위험이 있어
         # 신규 진입을 막는다. 조회 실패도 live 에서는 fail-closed.

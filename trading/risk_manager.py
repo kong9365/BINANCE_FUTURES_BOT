@@ -36,7 +36,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from config.settings import REGIME_TRADING_PARAMS, RISK_RULES
+from config.settings import PROBE_CONFIG, REGIME_TRADING_PARAMS, RISK_RULES
 
 logger = logging.getLogger(__name__)
 
@@ -417,7 +417,12 @@ class RiskManager:
             capital: 현재 자본 (wallet_balance).
         Returns:
             $20,000 이상 3, $5,000 이상 2, 그 외 1.
+            ★Probe 모드(PROBE_CONFIG.enabled): PROBE_CONFIG.max_concurrent(=2) 사용 —
+            $200 에서 기존 1→2 *게이트 완화*. 운영자 명시 승인(2026-05-31), probe 한정.
+            probe OFF 면 기존 자본 규모별 한도 그대로(완화 0).
         """
+        if PROBE_CONFIG.enabled:
+            return PROBE_CONFIG.max_concurrent
         if capital >= 20000:
             return RISK_RULES.max_concurrent_positions_above_20k
         if capital >= 5000:

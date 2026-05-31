@@ -13,7 +13,9 @@ import importlib
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
-from governance.probe_guard import evaluate_probe_halt
+import pytest
+
+from governance.probe_guard import evaluate_probe_halt, probe_size_usdt
 
 CFG = SimpleNamespace(
     total_loss_pct=0.15, daily_loss_pct=0.05, max_consec_losses=5,
@@ -117,3 +119,22 @@ def test_probe_config_defaults_and_env(monkeypatch):
     for k in ("PROBE_ENABLED", "PROBE_BUDGET_USDT", "PROBE_MAX_WEEKS"):
         monkeypatch.delenv(k, raising=False)
     importlib.reload(cfgmod)
+
+
+# ── probe_size_usdt (P2 — 결정적 0.5% risk, Kelly 우회) ──
+def test_probe_size_formula_and_deterministic():
+    # 0.005 * 200 * 100 / |100-99| = 100; min(100, 200) = 100
+    assert probe_size_usdt(100.0, 99.0, 200.0, 0.005) == pytest.approx(100.0)
+    # 결정적 — win_rate/연승 무입력, 반복 동일
+    assert len({probe_size_usdt(100.0, 99.0, 200.0, 0.005) for _ in range(20)}) == 1
+
+
+def test_probe_size_budget_cap_and_guards():
+    # 큰 risk_pct → budget 으로 클램프(초과 금지)
+    assert probe_size_usdt(100.0, 99.0, 200.0, 0.5) == pytest.approx(200.0)
+    # zero-dist → 0(차단)
+    assert probe_size_usdt(100.0, 100.0, 200.0, 0.005) == 0.0
+    # 비정상 입력 → 0
+    assert probe_size_usdt(0.0, 99.0, 200.0, 0.005) == 0.0
+    assert probe_size_usdt(100.0, 99.0, 0.0, 0.005) == 0.0
+    assert probe_size_usdt(100.0, 99.0, 200.0, 0.0) == 0.0

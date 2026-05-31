@@ -86,7 +86,7 @@ from data.oi_scanner import OIScanner
 # ── DB / 설정 ──
 from db.init_db import init_db
 from ops.system_health_monitor import SystemHealthMonitor
-from sizing.dynamic_sizer import DynamicPositionSizer
+from sizing.dynamic_sizer import DynamicPositionSizer, SizingResult
 from strategy.breakout import BreakoutConfig, evaluate_breakout
 from strategy.btc_risk_off import (
     BTCRiskOffState, evaluate as btc_risk_off_evaluate, is_halted as btc_is_halted,
@@ -95,7 +95,7 @@ from strategy.btc_risk_off import (
 # v3.2.0 M1: KillSwitch 어댑터 (governance §3.4.3)
 from governance.kill_switch import KillSwitch
 # Probe: 경계 있는 B-3 계측 — 다조건 HALT 평가 + 상태/카운트 헬퍼
-from governance.probe_guard import evaluate_probe_halt
+from governance.probe_guard import evaluate_probe_halt, probe_size_usdt
 from db.probe_state import (
     count_oi_surge_fills,
     count_oi_surge_unfilled,
@@ -985,23 +985,35 @@ class MainBot:
             setup_tag, return_count=True
         )
         avg_win, avg_loss = self.expectancy.get_avg_R(setup_tag)
-        budget_cap = min(
-            capital_snapshot.available_balance,
-            LIVE_PROBE_CONFIG.live_probe_budget_usdt,
-        )
-        sizing = self.sizer.calculate(
-            capital=budget_cap,
-            win_rate=win_rate,
-            avg_win_R=avg_win,
-            avg_loss_R=avg_loss,
-            regime=regime_state.regime,
-            confidence=regime_state.confidence,
-            sample_count=sample_count,
-            # A1 [2.2]: 손절거리 기반 risk cap (notional ≤ 0.5%/trade) — 사이즈 축소만.
-            entry_price=entry_price,
-            stop_loss=sl,
-            risk_per_trade_pct=RISK_RULES.risk_per_trade_pct,
-        )
+        if PROBE_CONFIG.enabled:
+            # Probe: 결정적 0.5% risk 사이징(Kelly 우회 — 연승/win_rate 무관, 고정).
+            # budget_cap = PROBE 예산($200). 하류 min_notional·>budget_cap 가드 유지.
+            budget_cap = min(capital_snapshot.available_balance, PROBE_CONFIG.budget_usdt)
+            _ps = probe_size_usdt(entry_price, sl, budget_cap, RISK_RULES.risk_per_trade_pct)
+            sizing = SizingResult(
+                size_pct=(_ps / budget_cap if budget_cap > 0 else 0.0), size_usdt=_ps,
+                kelly_raw=0.0, kelly_fraction_used=0.0, regime_cap_pct=0.0,
+                capital_cap_pct=0.0, confidence_factor=0.0, final_cap_pct=0.0,
+                reason=f"PROBE 0.5% risk 결정적(budget ${budget_cap:.0f})",
+            )
+        else:
+            budget_cap = min(
+                capital_snapshot.available_balance,
+                LIVE_PROBE_CONFIG.live_probe_budget_usdt,
+            )
+            sizing = self.sizer.calculate(
+                capital=budget_cap,
+                win_rate=win_rate,
+                avg_win_R=avg_win,
+                avg_loss_R=avg_loss,
+                regime=regime_state.regime,
+                confidence=regime_state.confidence,
+                sample_count=sample_count,
+                # A1 [2.2]: 손절거리 기반 risk cap (notional ≤ 0.5%/trade) — 사이즈 축소만.
+                entry_price=entry_price,
+                stop_loss=sl,
+                risk_per_trade_pct=RISK_RULES.risk_per_trade_pct,
+            )
         if sizing.size_usdt < SYSTEM_CONFIG.min_notional_usdt:
             logger.info(
                 "[Sizer] %s 최소 명목가치 미달: $%.2f", symbol, sizing.size_usdt
@@ -1050,6 +1062,8 @@ class MainBot:
             "pair_tier": pair_tier,
             "sizing_kelly_raw": sizing.kelly_raw,
             "sizing_pct": sizing.size_pct,
+            # Probe: executor 하드실링용 예산 cap(방어심층). probe OFF 면 None.
+            "budget_cap": budget_cap if PROBE_CONFIG.enabled else None,
             # v3.1.1: 진입 시점 자본 상태 (부록 E-5-2 / E-7-1)
             "wallet_balance_at_entry": capital_snapshot.wallet_balance,
             "available_at_entry": capital_snapshot.available_balance,
