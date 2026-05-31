@@ -51,6 +51,7 @@ import pandas as pd
 
 from sizing.dynamic_sizer import DynamicPositionSizer
 from strategy.breakout import BreakoutConfig, ema, evaluate_breakout
+from strategy.smc import SMCConfig, evaluate_smc
 from strategy.cost_guard import CostGuard
 from strategy.regime_detector import Regime, RegimeDetector
 
@@ -152,6 +153,14 @@ class BacktestConfig:
     # notional = risk_per_trade_pct × equity × entry / |entry−stop|  (stop 도달=이 risk 손실)
     risk_per_trade_pct: float = 0.0            # 0.005 = 코인당 0.5% 계좌 risk (A1 정합)
     max_concurrent_positions: int = 0          # >0: 동시 오픈 포지션 cap(없으면 하루 1회 기존)
+
+    # ── SMC 후보 (strategy=="smc" 일 때만). 사전확정 단일값(스윕 금지) ──
+    smc_swing_n: int = 2                        # fractal 좌우 봉수(5봉), i+N 이후 확정
+    smc_fvg_atr_mult: float = 0.25             # 최소 FVG 갭 ≥ 0.25·ATR
+    smc_sweep_lookback: int = 3                # 직전 K봉 내 liquidity sweep
+    smc_poi_lookback: int = 10                 # FVG/OB(point-of-interest) 신선도 윈도우
+    smc_atr_period: int = 14
+    smc_sl_atr_buffer: float = 0.1             # SL = sweep 극값 ∓ 0.1·ATR
 
     # 백테스트 시 펀딩비 적용 여부
     apply_funding: bool = True
@@ -282,6 +291,15 @@ class BacktestEngine:
             ema_period=config.breakout_ema,
             atr_stop_mult=config.breakout_atr_stop,
             atr_target_mult=config.breakout_atr_target,
+        )
+        # SMC 파라미터(strategy=="smc"). stateless 라 _reset 불필요.
+        self.smc_cfg = SMCConfig(
+            swing_n=config.smc_swing_n,
+            fvg_atr_mult=config.smc_fvg_atr_mult,
+            sweep_lookback=config.smc_sweep_lookback,
+            poi_lookback=config.smc_poi_lookback,
+            atr_period=config.smc_atr_period,
+            sl_atr_buffer=config.smc_sl_atr_buffer,
         )
 
         # run() 내부 상태 (run() 진입 시 _reset 로 초기화)
@@ -618,6 +636,8 @@ class BacktestEngine:
             return self._evaluate_oi_surge(symbol, ts, regime_state, equity)
         if self.config.strategy == "breakout":
             return self._evaluate_breakout(symbol, ts, regime_state, equity)
+        if self.config.strategy == "smc":
+            return self._evaluate_smc(symbol, ts, regime_state, equity)
 
         if regime_state.regime == Regime.TREND_UP:
             action = "LONG"
@@ -815,6 +835,56 @@ class BacktestEngine:
             sl_price=sl_price,
             atr=atr,
             pair_tier=pair_tier,
+            size_usdt=size_usdt,
+        )
+
+    def _evaluate_smc(
+        self, symbol: str, ts: Any, regime_state, equity: float
+    ) -> Optional[Signal]:
+        """SMC 셋업 B(구조+sweep+FVG/OB 복귀) — strategy/smc 공유 로직(룩어헤드 0).
+
+        신호 판정은 ts 이전 마감봉만으로. 진입가는 _resolve_entry_fill(post_only 기본).
+        청산 X(구조기반): SL = sweep 극값 ∓ 0.1·ATR, TP = 활성 범위 반대측(SH/SL).
+        _simulate_trade 의 고정 sl/tp 로 재사용(트레일 off — setup_tag 가 breakout 아님).
+        """
+        closed = self._get_candles_until(symbol, "1d", ts)
+        sig = evaluate_smc(closed, self.smc_cfg)
+        if sig is None:
+            return None
+
+        # B-6: 진입 체결 모델(post_only 기본). 미체결이면 스킵(라이브 정합).
+        filled, entry_price = self._resolve_entry_fill(symbol, ts, sig.action)
+        if not filled:
+            return None
+
+        buf = self.smc_cfg.sl_atr_buffer * sig.atr
+        if sig.action == "LONG":
+            sl_price = sig.sweep_extreme - buf
+            tp_price = sig.tp_level
+            ok = sl_price < entry_price < tp_price        # 구조 R:R > 0 보장
+        else:  # SHORT
+            sl_price = sig.sweep_extreme + buf
+            tp_price = sig.tp_level
+            ok = tp_price < entry_price < sl_price
+        if not ok or sl_price <= 0 or tp_price <= 0:
+            return None
+
+        size_usdt = self._size_position(equity, entry_price, sl_price, regime_state)
+        if size_usdt <= 0:
+            return None
+
+        return Signal(
+            symbol=symbol,
+            action=sig.action,
+            setup_tag=f"smc_{sig.action.lower()}",
+            regime=regime_state.regime,
+            confidence=regime_state.confidence,
+            entry_ts=ts,
+            entry_price=entry_price,
+            tp_price=tp_price,
+            sl_price=sl_price,
+            atr=sig.atr,
+            pair_tier=PAIR_TIERS.get(symbol, 2),
             size_usdt=size_usdt,
         )
 
