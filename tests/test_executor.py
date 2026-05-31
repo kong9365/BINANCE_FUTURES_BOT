@@ -34,6 +34,7 @@ import sqlite3
 from unittest.mock import MagicMock
 
 from db.init_db import init_db
+from governance.kill_switch import KillSwitch
 from trading.executor import TradeExecutor
 
 import pytest  # noqa: F401  (asyncio_mode=auto 가 async test 를 수집)
@@ -1129,12 +1130,15 @@ def test_a4_exit_unknown_no_stop_falls_back_to_entry_flagged(db_path, mock_binan
 
 
 @pytest.fixture(autouse=True)
-def _authorize_live_for_tests(monkeypatch):
+def _authorize_live_for_tests(monkeypatch, tmp_path):
     """기존 live 테스트가 A5 가드를 통과하도록 인가 env 설정(테스트 전역).
 
     개별 A5 차단 테스트는 같은 monkeypatch 로 delenv 하여 미인가 상태를 만든다.
+    S1: KillSwitch 격리 — 실제 data/KILLSWITCH 에 영향받지 않도록 존재하지 않는
+    tmp 경로로 고정(개별 kill 테스트는 이 경로에 파일을 만들어 활성화).
     """
     monkeypatch.setenv("LIVE_TRADING_ENABLED", "true")
+    monkeypatch.setenv("KILLSWITCH_FILE", str(tmp_path / "no_killswitch"))
 
 
 def test_a5_authorized_when_testnet(monkeypatch):
@@ -1244,3 +1248,48 @@ def test_b7_record_unfilled_swallows_error_isolated(mock_binance, tmp_path):
          "setup_tag": "oi_surge_long"},
         "fill_timeout",
     )   # 예외 미발생 = 격리 정상
+
+
+# =====================================================================
+# S1 — 끄는 선(kill line): executor 방어심층 (fail-closed)
+# =====================================================================
+
+
+async def test_s1_kill_active_blocks_live_entry(db_path, mock_binance, monkeypatch, tmp_path):
+    """KILLSWITCH 활성 → live 진입 차단 + 실주문 0 + trades 행 없음."""
+    monkeypatch.setenv("KILLSWITCH_FILE", str(tmp_path / "KS"))
+    KillSwitch.activate(reason="test halt", source="manual")   # 파일 생성
+    assert KillSwitch.is_active() is True
+    mock_binance.futures_exchange_info.return_value = _exinfo()
+
+    ex = TradeExecutor(mock_binance, db_path, dry_run=False)
+    result = await ex.enter_trade(_decision())
+
+    assert result["success"] is False
+    assert result["reason"] == "killswitch_active"
+    mock_binance.futures_create_order.assert_not_called()       # 실주문 미발생
+    assert _fetch_trades(db_path) == []
+
+
+async def test_s1_kill_check_failure_fail_closed(db_path, mock_binance, monkeypatch):
+    """KillSwitch 상태 조회 예외 → fail-closed 진입 차단(안전 우선)."""
+    def _raise(*a, **k):
+        raise RuntimeError("boom")
+    monkeypatch.setattr("trading.executor.KillSwitch.is_active", _raise)
+    mock_binance.futures_exchange_info.return_value = _exinfo()
+
+    ex = TradeExecutor(mock_binance, db_path, dry_run=False)
+    result = await ex.enter_trade(_decision())
+
+    assert result["success"] is False
+    assert result["reason"] == "killswitch_check_failed"
+    mock_binance.futures_create_order.assert_not_called()
+
+
+async def test_s1_kill_dry_run_paper_unaffected(db_path, mock_binance, monkeypatch, tmp_path):
+    """대조군: executor kill 체크는 live 전용 — dry_run 페이퍼는 영향 없음(메인루프가 차단)."""
+    monkeypatch.setenv("KILLSWITCH_FILE", str(tmp_path / "KS"))
+    KillSwitch.activate(reason="test halt", source="manual")
+    ex = TradeExecutor(mock_binance, db_path, dry_run=True)
+    result = await ex.enter_trade(_decision())
+    assert result["success"] is True          # dry_run 페이퍼 기록 정상

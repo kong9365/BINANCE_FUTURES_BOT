@@ -39,6 +39,7 @@ MIGRATION_V3_2_0 = MIGRATIONS_DIR / "v3_1_2_to_v3_2_0.sql"
 MIGRATION_V3_2_1 = MIGRATIONS_DIR / "v3_2_0_to_v3_2_1.sql"
 MIGRATION_V3_2_2 = MIGRATIONS_DIR / "v3_2_1_to_v3_2_2.sql"
 MIGRATION_V3_2_3 = MIGRATIONS_DIR / "v3_2_2_to_v3_2_3.sql"
+MIGRATION_V3_2_4 = MIGRATIONS_DIR / "v3_2_3_to_v3_2_4.sql"
 
 
 def get_applied_versions(conn: sqlite3.Connection) -> set[str]:
@@ -131,6 +132,14 @@ def init_db(db_path: Path | str = DEFAULT_DB_PATH) -> Path:
             logger.info("[init_db] v3.2.3 마이그레이션 적용 (unfilled_signals)")
         else:
             logger.info("[init_db] v3.2.3 이미 적용됨 — 건너뜀")
+
+        # 10. v3.2.4 델타 (Probe: 경계 있는 B-3 계측 프로브 상태 테이블)
+        if "v3.2.4" not in applied:
+            _apply_sql_file(conn, MIGRATION_V3_2_4)
+            conn.commit()
+            logger.info("[init_db] v3.2.4 마이그레이션 적용 (probe_state)")
+        else:
+            logger.info("[init_db] v3.2.4 이미 적용됨 — 건너뜀")
 
         final = sorted(get_applied_versions(conn))
         logger.info("[init_db] 완료 — 적용 버전: %s", final)

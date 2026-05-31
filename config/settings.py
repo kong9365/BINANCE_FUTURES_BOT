@@ -379,6 +379,68 @@ LIVE_PROBE_CONFIG = LiveProbeConfig()
 
 
 # ─────────────────────────────────────────────────────
+# Probe — 경계 있는 B-3 계측 실험 (소액 라이브, 사전확정·다조건 HALT)
+# 목적: post_only 15초 역선택(B-3) 실측 + 라이브 경험. 검증 엣지 배포 아님.
+# 전부 env override. PROBE_ENABLED 기본 False → off 면 행동 변화 0.
+# ─────────────────────────────────────────────────────
+def _resolve_probe_enabled() -> bool:
+    return (os.environ.get("PROBE_ENABLED") or "").strip().lower() in ("1", "true", "yes")
+
+
+def _resolve_probe_float(name: str, default: float) -> float:
+    """probe env float (>=0, 음수/파싱실패 → 기본값)."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        v = float(raw)
+    except ValueError:
+        logger.warning("[Config] %s 파싱 실패(%r) → %s 사용", name, raw, default)
+        return default
+    if v < 0:
+        logger.warning("[Config] %s < 0 (%s) → %s 사용", name, v, default)
+        return default
+    return v
+
+
+def _resolve_probe_int(name: str, default: int) -> int:
+    """probe env int (>=0, 음수/파싱실패 → 기본값). 0 허용(테스트 강제정지 등)."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        v = int(raw)
+    except ValueError:
+        logger.warning("[Config] %s 파싱 실패(%r) → %s 사용", name, raw, default)
+        return default
+    if v < 0:
+        logger.warning("[Config] %s < 0 (%s) → %s 사용", name, v, default)
+        return default
+    return v
+
+
+@dataclass
+class ProbeConfig:
+    # 활성화 — 운영자 명시 opt-in(env PROBE_ENABLED). 기본 OFF(행동 변화 0).
+    enabled: bool = field(default_factory=_resolve_probe_enabled)
+    # 예산 cap(USDT) — 사이징 capital 상한.
+    budget_usdt: float = field(default_factory=lambda: _resolve_probe_float("PROBE_BUDGET_USDT", 200.0))
+    # 전면 HALT(래칭) 임계 — 손실은 양수 비율로 저장(0.15 = -15% 도달 시 HALT).
+    total_loss_pct: float = field(default_factory=lambda: _resolve_probe_float("PROBE_TOTAL_LOSS_PCT", 0.15))
+    daily_loss_pct: float = field(default_factory=lambda: _resolve_probe_float("PROBE_DAILY_LOSS_PCT", 0.05))
+    max_consec_losses: int = field(default_factory=lambda: _resolve_probe_int("PROBE_MAX_CONSEC_LOSSES", 5))
+    # 자동정지(경계 있는 실험) — 데이터 목표 도달 또는 기간 경과.
+    n_fill: int = field(default_factory=lambda: _resolve_probe_int("PROBE_N_FILL", 30))
+    n_unfill: int = field(default_factory=lambda: _resolve_probe_int("PROBE_N_UNFILL", 30))
+    max_weeks: int = field(default_factory=lambda: _resolve_probe_int("PROBE_MAX_WEEKS", 4))
+    # 동시보유 cap — ★운영자 명시 승인 완화($200서 기존 1→2). probe 모드 한정.
+    max_concurrent: int = field(default_factory=lambda: _resolve_probe_int("PROBE_MAX_CONCURRENT", 2))
+
+
+PROBE_CONFIG = ProbeConfig()
+
+
+# ─────────────────────────────────────────────────────
 # OIScanner (Layer 3 — OI 급증 후보 스캔)
 # ─────────────────────────────────────────────────────
 @dataclass

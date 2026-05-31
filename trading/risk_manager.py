@@ -533,6 +533,15 @@ class RiskManager:
             conn.close()
         return int(row[0]) if row and row[0] is not None else 0
 
+    def get_loss_streak(self) -> int:
+        """현재 연속 손실 횟수 (공개 래퍼 — probe_guard 등 외부용). 조회 로직 무변경."""
+        streak, _ = self._get_loss_streak()
+        return streak
+
+    def get_open_position_count(self) -> int:
+        """현재 열린 포지션 수 (공개 래퍼)."""
+        return self._get_open_position_count()
+
     @staticmethod
     def _parse_ts(ts: str | None) -> datetime | None:
         """trades.timestamp(TEXT)를 UTC tz-aware datetime으로 파싱한다.

@@ -63,6 +63,7 @@ from config.settings import (
     COST_GUARD_CONFIG,
     HEALTH_MONITOR_CONFIG,
     LIVE_PROBE_CONFIG,
+    PROBE_CONFIG,
     MACRO_EVENT_CONFIG,
     OISCANNER_CONFIG,
     PAIR_WHITELIST_CONFIG,
@@ -93,6 +94,13 @@ from strategy.btc_risk_off import (
 
 # v3.2.0 M1: KillSwitch 어댑터 (governance §3.4.3)
 from governance.kill_switch import KillSwitch
+# Probe: 경계 있는 B-3 계측 — 다조건 HALT 평가 + 상태/카운트 헬퍼
+from governance.probe_guard import evaluate_probe_halt
+from db.probe_state import (
+    count_oi_surge_fills,
+    count_oi_surge_unfilled,
+    get_or_init_probe_state,
+)
 
 # v3.2.0 M14: 5-Agent shadow runner 셋업 헬퍼 (ENABLE_SHADOW_AGENTS env 게이트)
 from governance.shadow_setup import build_shadow_runner_for_main_bot
@@ -503,6 +511,22 @@ class MainBot:
         # 4) 초기 자본 영속화 (부록 E-7-2 — 재시작 시 복원)
         self._sync_initial_capital(initial_snapshot)
 
+        # 4-aa) S1: 시작 시 KillSwitch 상태 명시 점검 (끄는 선) ──
+        # 활성 상태로 기동하면 메인루프가 신규 진입을 차단한다(운영자 해제 필요).
+        # 시작 시점엔 btc_state 미평가 → 파일 기반(수동/daily_loss 자동)만 확인.
+        if KillSwitch.is_active():
+            status = KillSwitch.get_status() or {}
+            logger.critical(
+                "[Start] ⚠️ KillSwitch 활성 상태로 기동 — source=%s reason=%s. "
+                "신규 진입 차단됨(운영자 해제 필요).",
+                status.get("source"), status.get("reason"),
+            )
+            await self.telegram.send(
+                "🛑 KillSwitch 활성 상태로 봇 기동\n"
+                f"source={status.get('source')} reason={status.get('reason')}\n"
+                "신규 진입 차단됨. 해제하려면 운영자가 KILLSWITCH 파일 삭제."
+            )
+
         # 4-b) live 계좌 사전 점검 (Protected Existing Position Coexist Mode)
         #     기존 포지션/주문/algo 가 모두 보호종목이면 공존 허용, 비보호 잔존 시 차단.
         #     dry_run 은 거래소 조회를 하지 않는다(API 미호출 원칙).
@@ -712,6 +736,60 @@ class MainBot:
         except Exception as e:
             logger.error("[Main] 자본 조회 실패: %s", e)
             return
+
+        # ── Probe: 경계 있는 B-3 계측 — 다조건 전면 HALT (PROBE_ENABLED 일 때만) ──
+        # risk_manager per-iteration 게이트와 별개로, 임계 도달 시 KillSwitch 를 *영속*
+        # 활성화(래칭). 실제 위반=래칭 / 일시적 조회실패(unevaluable)=래칭 없이 당 iter 차단.
+        # probe OFF 면 이 블록 전체 skip → 행동 변화 0.
+        if PROBE_CONFIG.enabled:
+            _now = datetime.now(timezone.utc)
+            _now_iso = _now.isoformat()
+            ps = get_or_init_probe_state(
+                self.db_path, initial_capital=capital_snapshot.wallet_balance,
+                budget_usdt=PROBE_CONFIG.budget_usdt, n_fill=PROBE_CONFIG.n_fill,
+                n_unfill=PROBE_CONFIG.n_unfill, max_weeks=PROBE_CONFIG.max_weeks,
+                now_iso=_now_iso,
+            )
+            _start_iso = ps.get("probe_start_at") if ps else None
+            _probe_start_at = None
+            if _start_iso:
+                try:
+                    _probe_start_at = datetime.fromisoformat(_start_iso)
+                    if _probe_start_at.tzinfo is None:
+                        _probe_start_at = _probe_start_at.replace(tzinfo=timezone.utc)
+                except (ValueError, TypeError):
+                    _probe_start_at = None
+            try:
+                _streak = self.risk_manager.get_loss_streak()
+            except Exception:  # noqa: BLE001 — streak 불가 → evaluate fail-closed 처리
+                _streak = None
+            _since = _start_iso or _now_iso
+            halt = evaluate_probe_halt(
+                current_wallet=capital_snapshot.wallet_balance,
+                initial_capital=(ps.get("initial_capital_usdt") if ps else None),
+                daily_start_capital=self.capital_manager.get_daily_start_capital(),
+                loss_streak=_streak,
+                filled_count=count_oi_surge_fills(self.db_path, _since),
+                unfilled_count=count_oi_surge_unfilled(self.db_path, _since),
+                probe_start_at=_probe_start_at,
+                now=_now,
+                cfg=PROBE_CONFIG,
+            )
+            if halt.halt:
+                if halt.unevaluable:
+                    logger.critical("[Probe] HALT 평가불가(%s) → 래칭 없이 당 iter 차단", halt.reason)
+                    return
+                KillSwitch.activate(
+                    reason=halt.reason or halt.source or "probe_halt",
+                    source=halt.source or "probe",
+                )
+                _kind = "자동정지(데이터/기간)" if halt.auto_stop else "전면 HALT(손실)"
+                logger.critical("[Probe] %s → KillSwitch 활성: %s", _kind, halt.reason)
+                await self.telegram.send(
+                    f"🛑 Probe {_kind} → KillSwitch 자동 활성(영속)\n{halt.reason}\n"
+                    "해제: 운영자가 KILLSWITCH 파일 삭제."
+                )
+                return
 
         # ── Layer 1+2: 데이터 + 시장 컨텍스트 ──
         candles_4h = await self.collector.get_candles(_CONTEXT_SYMBOL, "4h", 100)

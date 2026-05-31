@@ -54,6 +54,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
 
+from governance.kill_switch import KillSwitch
+
 logger = logging.getLogger(__name__)
 
 # enter_trade(decision) 필수 키 (boundary 검증)
@@ -254,6 +256,23 @@ class TradeExecutor:
             return self._fail(
                 symbol, decision, "live_trading_not_authorized", critical=True,
             )
+
+        # ── live: 끄는 선 (S1) — KillSwitch 방어심층(파일 기반) ──
+        # 메인루프 _iter 가 이미 신규진입 전 차단하나, 우회·버그 대비 *돈 나가는
+        # 지점 자체*가 거부한다. fail-closed: 상태 조회 실패 시에도 차단(안전 우선).
+        # btc_state 는 메인루프가 평가하므로 여기선 파일 기반(수동/daily_loss 자동)만 확인.
+        try:
+            ks_active = KillSwitch.is_active()
+        except Exception as e:  # noqa: BLE001 — 조회 실패 = 차단(fail-closed)
+            logger.critical(
+                "[Executor] %s KillSwitch 조회 실패 → fail-closed 차단: %s", symbol, e,
+            )
+            return self._fail(
+                symbol, decision, "killswitch_check_failed", critical=True,
+            )
+        if ks_active:
+            logger.critical("[Executor] %s KillSwitch 활성 → 진입 차단 (S1 방어심층)", symbol)
+            return self._fail(symbol, decision, "killswitch_active", critical=True)
 
         # ── live: Hedge Mode 차단 (A-4) ──
         # One-way Mode 전제. Hedge Mode 면 positionSide 누락/오매칭 위험이 있어
