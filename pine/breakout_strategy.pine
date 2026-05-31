@@ -1,0 +1,115 @@
+//@version=5
+// ════════════════════════════════════════════════════════════════════════════
+//  Breakout Strategy — VISUAL ONLY  (Donchian20 + EMA200 + ADX25, Chandelier 3·ATR)
+//  돌파 전략 시각화 전용 — BINANCE_FUTURES_BOT 의 daily_tsmom/breakout 로직 이식
+//
+//  사용법(1줄): TradingView → Pine 편집기에 이 파일 전체 붙여넣기 → "차트에 추가"
+//               → 일봉(1D) 차트에 적용(봇이 1d 로 평가하므로 TF=1D 권장).
+// ────────────────────────────────────────────────────────────────────────────
+//  ★★★ 한계 — 반드시 먼저 읽을 것 (READ FIRST) ★★★
+//  • 이 Pine 은 *시각화 전용*이다. **판정용이 아니다.** 진입/청산 위치를 "눈으로
+//    보는" 용도일 뿐, 전략의 수익성·채택 여부를 여기서 결정하지 않는다.
+//  • 파이썬 봇과 *별개 코드*다. **동기화 아님.** 봇이 바뀌어도 이 파일은 안 바뀐다.
+//  • TradingView 백테스터는 다음을 **반영하지 못한다**:
+//      - post_only(GTX) 지정가 **미체결(B-3 역선택)** — 봇은 15초 post-only 라
+//        달아난 승자는 미체결되고 되돌아온 패자만 체결될 수 있다. Pine 은 그냥
+//        다음 봉에 체결한다(완전히 다른 게임).
+//      - 현실 **슬리피지 / 수수료 / 펀딩비**.
+//    → 따라서 이 차트의 **손익·승률·PnL 수치 ≠ 실제.** 절대 그대로 믿지 말 것.
+//  • **실제 판정은 파이썬 게이트**(CostGuard·post_only 체결모델·비용 반영)로만 한다.
+//  • **튜닝 금지** — 파라미터는 input 으로 노출하되 기본값을 봇과 동일하게 고정했다.
+//    숫자를 바꿔 "더 좋아 보이게" 만드는 것은 과최적화이며 의미 없다.
+// ════════════════════════════════════════════════════════════════════════════
+
+strategy("Breakout (Donchian20+EMA200+ADX) — VISUAL ONLY",
+     overlay                 = true,
+     pyramiding              = 0,
+     calc_on_every_tick      = false,
+     process_orders_on_close = false,
+     default_qty_type        = strategy.percent_of_equity,
+     default_qty_value       = 10,
+     initial_capital         = 10000)
+// ※ 위 사이징(자본 10%)은 *시각화용 임의값*이다. 봇은 위험기반(거래당 0.5% risk)
+//   사이징을 쓴다 → 여기 PnL/수익률은 의미 없음(위 한계 주석 참조).
+
+// ── 파라미터 (기본값 = 봇과 동일, 튜닝 금지) ────────────────────────────────
+donLen     = input.int(20,    "Donchian 길이 (직전 N봉, 현재봉 제외)", minval=1)
+emaLen     = input.int(200,   "EMA 길이 (추세필터)",                   minval=1)
+adxLen     = input.int(14,    "ADX/ATR 길이",                          minval=1)
+adxMin     = input.float(25,  "ADX 최소 (추세 강도)",                  minval=0)
+atrLen     = input.int(14,    "ATR 길이",                              minval=1)
+stopMult   = input.float(2.0, "초기 손절 ATR 배수",          minval=0.1, step=0.1)
+trailMult  = input.float(3.0, "Chandelier 트레일 ATR 배수",  minval=0.1, step=0.1)
+allowLong  = input.bool(true, "롱 허용")
+allowShort = input.bool(true, "숏 허용")
+
+// ── 지표 ────────────────────────────────────────────────────────────────────
+emaV = ta.ema(close, emaLen)
+atrV = ta.atr(atrLen)                          // Wilder ATR (봇과 동일)
+// ADX: Pine v5 엔 단일 ta.adx() 가 없다 → ta.dmi() 가 [+DI, -DI, ADX] 튜플 반환.
+[diPlus, diMinus, adxV] = ta.dmi(adxLen, adxLen)
+// Donchian: 봇은 '현재 마감봉 제외' 직전 N봉의 고/저 = highs[-(N+1):-1].
+//   → Pine 에선 ta.highest(...)[1] 로 현재봉을 제외해야 한다. 현재봉 포함(ta.highest(N))
+//     으로 하면 close 가 자기 자신의 high 를 못 넘어 신호가 거의 안 뜬다 → [1] 필수.
+donUp = ta.highest(high, donLen)[1]
+donDn = ta.lowest(low,  donLen)[1]
+
+// ── 진입 신호 (AND 조건 = 봇과 동일) ────────────────────────────────────────
+//   LONG  = close > 채널상단  AND  close > EMA200  AND  ADX ≥ 25
+//   SHORT = close < 채널하단  AND  close < EMA200  AND  ADX ≥ 25
+longCond  = allowLong  and close > donUp and close > emaV and adxV >= adxMin
+shortCond = allowShort and close < donDn and close < emaV and adxV >= adxMin
+
+// 봇은 '플랫일 때만' 신규 진입(포지션당 1개, 청산은 트레일이 담당) → 동일하게 가드.
+if longCond and strategy.position_size == 0
+    strategy.entry("L", strategy.long)
+if shortCond and strategy.position_size == 0
+    strategy.entry("S", strategy.short)
+
+// ── 청산: 초기 SL(entry∓2·ATR) + Chandelier 트레일(3·ATR). 고정 TP 없음. ─────
+//   ATR 은 *진입 시점 값으로 고정*(봇 _simulate_trade 와 동일) → atrEntry 에 캡처.
+//   트레일은 유리한 방향으로만 ratchet(LONG=상단만 상승, SHORT=하단만 하락).
+var float atrEntry  = na
+var float extremeP  = na
+var float trailStop = na
+
+longEntered  = strategy.position_size > 0 and strategy.position_size[1] <= 0
+shortEntered = strategy.position_size < 0 and strategy.position_size[1] >= 0
+
+if longEntered
+    atrEntry  := atrV
+    extremeP  := high
+    trailStop := strategy.position_avg_price - stopMult * atrEntry
+if shortEntered
+    atrEntry  := atrV
+    extremeP  := low
+    trailStop := strategy.position_avg_price + stopMult * atrEntry
+
+if strategy.position_size > 0
+    extremeP  := math.max(extremeP, high)                              // 진입 후 최고가
+    trailStop := math.max(trailStop, extremeP - trailMult * atrEntry)  // 위로만 ratchet
+    strategy.exit("L-Exit", from_entry="L", stop=trailStop)
+if strategy.position_size < 0
+    extremeP  := math.min(extremeP, low)                               // 진입 후 최저가
+    trailStop := math.min(trailStop, extremeP + trailMult * atrEntry)  // 아래로만 ratchet
+    strategy.exit("S-Exit", from_entry="S", stop=trailStop)
+
+// ── 플롯 ────────────────────────────────────────────────────────────────────
+plot(emaV,  "EMA200",              color=color.orange,             linewidth=2)
+plot(donUp, "Donchian 상단(직전20)", color=color.new(color.teal, 0))
+plot(donDn, "Donchian 하단(직전20)", color=color.new(color.maroon, 0))
+plot(strategy.position_size != 0 ? trailStop : na, "트레일/손절",
+     color=color.red, style=plot.style_linebr, linewidth=2)
+
+// 신호 마커(진입 트리거 봉) — 실제 체결은 다음 봉(아래 한계 참조).
+plotshape(longCond  and strategy.position_size == 0, title="롱 신호",
+     style=shape.triangleup,   location=location.belowbar, color=color.green, size=size.tiny)
+plotshape(shortCond and strategy.position_size == 0, title="숏 신호",
+     style=shape.triangledown, location=location.abovebar, color=color.red,   size=size.tiny)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  재확인(하단): 이건 **시각화**다. 실제 판정 ≠ TradingView 수치.
+//  • Pine 진입 체결 = 신호 다음 봉(기본). 봇 = GTX post-only 15초(미체결 가능, B-3).
+//  • 고정 TP 없음 — 트레일만으로 청산(봇 Chandelier 트레일 모드와 동일 논리).
+//  • 비용/펀딩/슬리피지/미체결 미반영 → 수익성 판단은 반드시 파이썬 게이트로만.
+// ════════════════════════════════════════════════════════════════════════════
