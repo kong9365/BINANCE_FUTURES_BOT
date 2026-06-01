@@ -51,7 +51,7 @@ import pandas as pd
 
 from sizing.dynamic_sizer import DynamicPositionSizer
 from strategy.breakout import (
-    BreakoutConfig, ema, evaluate_breakout, rolling_return_sign, rsi_wilder, sma,
+    BreakoutConfig, ema, evaluate_breakout, rolling_return_sign, rsi_wilder, sma, stdev,
 )
 from strategy.smc import SMCConfig, evaluate_smc
 from strategy.cost_guard import CostGuard
@@ -128,6 +128,11 @@ class BacktestConfig:
     # 종가가 SMA(exit_ma_period) 반대편으로 교차할 때 청산(MA_EXIT). 저회전 추세(Faber)용.
     exit_ma_period: int = 0
 
+    # 성능 캡(opt-in, 기본 0=off=전체 history=기존 동작 불변). >0 이면 _get_candles_until 이
+    # 직전 N봉만 반환(15m 등 장기 분봉의 O(n²) 회피, 룩어헤드0). 유한윈도 지표는 정확,
+    # EMA200은 윈도 근사(시드 가중 ~e-4, 테스트 tol·리포트 명시).
+    max_lookback_bars: int = 0
+
     # 최대 보유 봉 수(시간 스톱). 돌파처럼 추세추종은 길게 끌 수 있어 설정화.
     time_stop_bars: int = DEFAULT_TIME_STOP_BARS
 
@@ -187,6 +192,17 @@ class BacktestConfig:
     meanrev_atr_period: int = 14
     meanrev_atr_tp_mult: float = 1.0
     meanrev_atr_stop_mult: float = 2.0
+    # vol_breakout (Larry Williams 변동성 돌파, 15m): day_open ± k·prev_range
+    volbreak_k: float = 0.5
+    volbreak_atr_period: int = 14
+    volbreak_atr_stop_mult: float = 2.0
+    volbreak_atr_target_mult: float = 3.0
+    # intra_mean_rev (볼린저 평균회귀, 15m): TP=BB중심(SMA)@진입, SL=재난 ATR
+    intramr_bb_period: int = 20
+    intramr_bb_std: float = 2.0
+    intramr_ema_period: int = 200
+    intramr_atr_period: int = 14
+    intramr_atr_stop_mult: float = 1.5
 
     # 백테스트 시 펀딩비 적용 여부
     apply_funding: bool = True
@@ -330,6 +346,9 @@ class BacktestEngine:
 
         # run() 내부 상태 (run() 진입 시 _reset 로 초기화)
         self._candles_by_pair: Dict[str, pd.DataFrame] = {}
+        # _get_candles_until 튜플 캐시(성능): {symbol: (df, [(o,h,l,c,v,ts),...])}.
+        # 심볼별 1회 생성 후 슬라이스 재사용. df identity 가 바뀌면(run 정규화) 자동 재생성.
+        self._tuple_cache: Dict[str, tuple] = {}
         self._regime_ref: str = "BTCUSDT"
         self._bar_seconds: float = 86400.0
 
@@ -494,19 +513,24 @@ class BacktestEngine:
         df = self._candles_by_pair.get(symbol)
         if df is None or len(df) == 0:
             return []
-        # 핵심: strict less-than. ts 봉 제외.
-        sub = df[df.index < ts]
-        return [
-            (
-                float(r.open),
-                float(r.high),
-                float(r.low),
-                float(r.close),
-                float(r.volume),
-                r.Index,
-            )
-            for r in sub.itertuples(index=True)
-        ]
+        # 튜플 캐시(성능): 심볼별 (o,h,l,c,v,ts) 리스트를 1회만 생성 → 이후 호출은
+        # searchsorted + 리스트 슬라이스만(봉당 DataFrame/float 재생성 제거). 출력 동일.
+        cached = self._tuple_cache.get(symbol)
+        if cached is None or cached[0] is not df:
+            rows = [
+                (float(r.open), float(r.high), float(r.low), float(r.close),
+                 float(r.volume), r.Index)
+                for r in df.itertuples(index=True)
+            ]
+            cached = (df, rows)
+            self._tuple_cache[symbol] = cached
+        rows = cached[1]
+        # 핵심: strict less-than(룩어헤드0). searchsorted(left)=ts 미만 개수.
+        pos = int(df.index.searchsorted(ts, side="left"))
+        cap = self.config.max_lookback_bars
+        if cap > 0:
+            return rows[max(0, pos - cap):pos]      # 직전 cap봉(full 꼬리와 비트단위 동일)
+        return rows[:pos]
 
     def _get_funding_at(self, symbol: str, ts: Any) -> float:
         """ts 이전 가장 최근 마감봉의 funding_rate 반환 (발표·실현 시점 이후).
@@ -670,6 +694,10 @@ class BacktestEngine:
             return self._evaluate_tsmom_ens(symbol, ts, regime_state, equity)
         if self.config.strategy == "mean_rev":
             return self._evaluate_mean_rev(symbol, ts, regime_state, equity)
+        if self.config.strategy == "vol_breakout":
+            return self._evaluate_vol_breakout(symbol, ts, regime_state, equity)
+        if self.config.strategy == "intra_mean_rev":
+            return self._evaluate_intra_mean_rev(symbol, ts, regime_state, equity)
 
         if regime_state.regime == Regime.TREND_UP:
             action = "LONG"
@@ -1058,6 +1086,116 @@ class BacktestEngine:
             return None
         return Signal(
             symbol=symbol, action=action, setup_tag=f"mean_rev_{action.lower()}",
+            regime=regime_state.regime, confidence=regime_state.confidence,
+            entry_ts=ts, entry_price=entry_price, tp_price=tp_price, sl_price=sl_price,
+            atr=atr, pair_tier=PAIR_TIERS.get(symbol, 2), size_usdt=size_usdt,
+        )
+
+    def _evaluate_vol_breakout(
+        self, symbol: str, ts: Any, regime_state, equity: float
+    ) -> Optional[Signal]:
+        """15m Larry Williams 변동성 돌파 — 직전 마감봉 close 가 당일오픈 ± k·전일레인지
+        돌파. ORB(세션 오프닝레인지) 아님. day_open=당일 00:00 UTC 봉(이미 마감),
+        prev_range=직전 UTC일 고−저. 청산 고정 TP/SL + 짧은 time_stop. 룩어헤드 0.
+        """
+        cfg = self.config
+        closed = self._get_candles_until(symbol, "15m", ts)
+        if len(closed) < cfg.volbreak_atr_period + 1:
+            return None
+        last_ts = closed[-1][5]
+        cur_date = last_ts.normalize()                  # 마지막 마감봉의 날짜(00:00)
+        prev_date = cur_date - pd.Timedelta(days=1)
+        day_open = None
+        prev_high = prev_low = None
+        for o, h, l, c, v, t in closed:                 # 룩어헤드0: 모두 < ts
+            td = t.normalize()
+            if t == cur_date:                           # 당일 00:00 봉 = day_open
+                day_open = o
+            elif td == prev_date:                       # 전일 봉 → 레인지
+                prev_high = h if prev_high is None else max(prev_high, h)
+                prev_low = l if prev_low is None else min(prev_low, l)
+        if day_open is None or prev_high is None or prev_low is None:
+            return None
+        prev_range = prev_high - prev_low
+        if prev_range <= 0:
+            return None
+        last_close = closed[-1][3]
+        if last_close > day_open + cfg.volbreak_k * prev_range:
+            action = "LONG"
+        elif last_close < day_open - cfg.volbreak_k * prev_range:
+            action = "SHORT"
+        else:
+            return None
+        if cfg.long_only and action != "LONG":
+            return None
+        atr = self._calc_atr(closed, cfg.volbreak_atr_period)
+        if atr <= 0:
+            return None
+        filled, entry_price = self._resolve_entry_fill(symbol, ts, action)
+        if not filled:
+            return None
+        if action == "LONG":
+            tp_price = entry_price + cfg.volbreak_atr_target_mult * atr
+            sl_price = entry_price - cfg.volbreak_atr_stop_mult * atr
+        else:
+            tp_price = entry_price - cfg.volbreak_atr_target_mult * atr
+            sl_price = entry_price + cfg.volbreak_atr_stop_mult * atr
+        if sl_price <= 0 or tp_price <= 0:
+            return None
+        size_usdt = self._size_position(equity, entry_price, sl_price, regime_state)
+        if size_usdt <= 0:
+            return None
+        return Signal(
+            symbol=symbol, action=action, setup_tag=f"vol_breakout_{action.lower()}",
+            regime=regime_state.regime, confidence=regime_state.confidence,
+            entry_ts=ts, entry_price=entry_price, tp_price=tp_price, sl_price=sl_price,
+            atr=atr, pair_tier=PAIR_TIERS.get(symbol, 2), size_usdt=size_usdt,
+        )
+
+    def _evaluate_intra_mean_rev(
+        self, symbol: str, ts: Any, regime_state, equity: float
+    ) -> Optional[Signal]:
+        """15m 볼린저 평균회귀 — EMA200 추세필터 하 BB(20,2σ) 밴드 이탈 진입,
+        TP=BB중심(SMA20)@진입(평균복귀 목표), SL=재난 ATR. 룩어헤드 0.
+        """
+        cfg = self.config
+        closed = self._get_candles_until(symbol, "15m", ts)
+        closes = [c[3] for c in closed]
+        mid = sma(closes, cfg.intramr_bb_period)
+        sd = stdev(closes, cfg.intramr_bb_period)
+        ema_val = ema(closes, cfg.intramr_ema_period)
+        if mid is None or sd is None or ema_val is None:
+            return None
+        last_close = closes[-1]
+        band = cfg.intramr_bb_std * sd
+        if last_close < mid - band and last_close > ema_val:
+            action = "LONG"                              # 상승추세 + 과매도 이탈
+        elif last_close > mid + band and last_close < ema_val:
+            action = "SHORT"
+        else:
+            return None
+        if cfg.long_only and action != "LONG":
+            return None
+        atr = self._calc_atr(closed, cfg.intramr_atr_period)
+        if atr <= 0:
+            return None
+        filled, entry_price = self._resolve_entry_fill(symbol, ts, action)
+        if not filled:
+            return None
+        tp_price = mid                                   # 평균복귀 목표(SMA20@진입)
+        if action == "LONG":
+            sl_price = entry_price - cfg.intramr_atr_stop_mult * atr
+            ok = sl_price < entry_price < tp_price       # R:R > 0 (목표가 위)
+        else:
+            sl_price = entry_price + cfg.intramr_atr_stop_mult * atr
+            ok = tp_price < entry_price < sl_price
+        if not ok or sl_price <= 0 or tp_price <= 0:
+            return None
+        size_usdt = self._size_position(equity, entry_price, sl_price, regime_state)
+        if size_usdt <= 0:
+            return None
+        return Signal(
+            symbol=symbol, action=action, setup_tag=f"intra_mean_rev_{action.lower()}",
             regime=regime_state.regime, confidence=regime_state.confidence,
             entry_ts=ts, entry_price=entry_price, tp_price=tp_price, sl_price=sl_price,
             atr=atr, pair_tier=PAIR_TIERS.get(symbol, 2), size_usdt=size_usdt,

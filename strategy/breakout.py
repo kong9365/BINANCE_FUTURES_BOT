@@ -217,6 +217,18 @@ def rsi_wilder(closes: Sequence[float], period: int) -> Optional[float]:
     return 100.0 - 100.0 / (1.0 + rs)
 
 
+def stdev(values: Sequence[float], period: int) -> Optional[float]:
+    """직전 period봉 표본표준편차(ddof=1). 볼린저밴드용 — indicators.bollinger_bands
+    (pandas .std(ddof=1))와 동일 정의. period≤1 또는 부족 시 None.
+    """
+    if period <= 1 or len(values) < period:
+        return None
+    w = values[-period:]
+    m = sum(w) / period
+    var = sum((x - m) ** 2 for x in w) / (period - 1)
+    return var ** 0.5
+
+
 # ─────────────────────────────────────────────────────
 # 신호 평가
 # ─────────────────────────────────────────────────────

@@ -218,6 +218,16 @@ def test_rsi_wilder_parity_with_indicators():
         assert mine is not None and abs(mine - ref) < 1e-6, (period, mine, ref)
 
 
+def test_stdev_sample_ddof1_and_insufficient():
+    assert bo.stdev([1.0, 2.0], 3) is None             # 부족
+    assert bo.stdev([5.0], 2) is None
+    vals = [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]
+    ref_full = float(pd.Series(vals).std(ddof=1))      # 표본 std (BB와 동일)
+    assert abs(bo.stdev(vals, len(vals)) - ref_full) < 1e-9
+    ref3 = float(pd.Series(vals[-3:]).std(ddof=1))     # 마지막 3봉만
+    assert abs(bo.stdev(vals, 3) - ref3) < 1e-9
+
+
 # ── 엔진 MA-교차 청산 (exit_ma_period — 새 가설 Faber) ──────────────────────
 def _ma_df(last_low=99.5):
     """LONG MA-교차용: 상승(SMA 위)하다 idx6 종가가 SMA(3) 아래로 교차.

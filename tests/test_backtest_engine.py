@@ -480,3 +480,43 @@ def test_pc_breakout_full_flow_risk_sizing_no_crash():
     assert isinstance(result.trades, list)
     for t in result.trades:
         assert t.size_usdt > 0                        # risk-based notional 산출됨
+
+
+# ── max_lookback_bars 성능 캡 (15m — 룩어헤드0, 슬라이스 정확/EMA 근사) ────────
+def test_max_lookback_default_off_full_history():
+    """기본 0 → 전체 strict<ts (기존 동작 불변 회귀 가드)."""
+    df = make_candles("up", n=60)
+    eng = BacktestEngine(BacktestConfig(pairs=["X"]))       # max_lookback_bars=0
+    eng._candles_by_pair = {"X": df}
+    out = eng._get_candles_until("X", "1d", df.index[40])
+    assert len(out) == 40 and all(c[5] < df.index[40] for c in out)
+
+
+def test_max_lookback_cap_slice_exact_and_lookahead():
+    """cap=N → full 의 마지막 N행과 *비트단위 동일* + 룩어헤드0."""
+    df = make_candles("up", n=60)
+    ts = df.index[50]
+    full = BacktestEngine(BacktestConfig(pairs=["X"]))
+    full._candles_by_pair = {"X": df}
+    out_full = full._get_candles_until("X", "1d", ts)
+    cap = BacktestEngine(BacktestConfig(pairs=["X"], max_lookback_bars=10))
+    cap._candles_by_pair = {"X": df}
+    out_cap = cap._get_candles_until("X", "1d", ts)
+    assert len(out_cap) == 10
+    assert out_cap == out_full[-10:]                       # 같은 행(비트단위)
+    assert all(c[5] < ts for c in out_cap)                 # 룩어헤드0
+
+
+def test_max_lookback_ema200_within_tol_finite_indicators_exact():
+    """EMA200 은 capped(1000) vs full 비트정확 불가 → 상대오차 ≤ tol(운영자 지적).
+    유한윈도 지표(SMA/Donchian)는 capped 에서 정확 동치."""
+    from strategy import breakout as bo
+    closes, p = [], 100.0
+    for i in range(3000):
+        p *= 1.0 + (0.0008 if i % 2 == 0 else -0.0006)     # 결정적 추세+노이즈
+        closes.append(p)
+    rel = abs(bo.ema(closes[-1000:], 200) - bo.ema(closes, 200)) / bo.ema(closes, 200)
+    assert rel <= 1e-3, rel                                # 윈도 근사(비트정확 아님)
+    assert bo.sma(closes[-1000:], 20) == bo.sma(closes, 20)        # 유한윈도 = 정확
+    assert bo.donchian([c + 1 for c in closes][-1000:], closes[-1000:], 20) == \
+           bo.donchian([c + 1 for c in closes], closes, 20)       # Donchian 정확
