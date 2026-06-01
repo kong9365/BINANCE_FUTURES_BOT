@@ -49,6 +49,8 @@ class IndicatorState:
     trend_dir: Optional[str]            # "LONG"|"SHORT"|None (EMA200+Donchian)
     oi_change_pct: Optional[float]      # None 이면 OI 미사용(과거)
     ema_val: Optional[float]
+    don_up: Optional[float]             # Donchian 상단(직전 N봉, 현재봉 제외)
+    don_dn: Optional[float]             # Donchian 하단
     atr_val: float
     close: float
 
@@ -90,18 +92,51 @@ def compute_indicators(
     ema_val = ema(closes, cfg.ema_period)
     ch = donchian(highs, lows, cfg.donchian_period)
     a = atr(highs, lows, closes, cfg.atr_period)
+    don_up = ch[0] if ch is not None else None
+    don_dn = ch[1] if ch is not None else None
     trend_dir = None
     if ema_val is not None and ch is not None:
-        up, dn = ch
-        if last.close > ema_val and last.close > up:
+        if last.close > ema_val and last.close > don_up:
             trend_dir = "LONG"
-        elif last.close < ema_val and last.close < dn:
+        elif last.close < ema_val and last.close < don_dn:
             trend_dir = "SHORT"
     # 2. OI 변화율 (실시간 전용; 과거 None)
     oi_change = None
     if oi_now is not None and oi_prev not in (None, 0):
         oi_change = (oi_now - oi_prev) / oi_prev * 100.0
-    return IndicatorState(vol_ratio, taker_ratio, trend_dir, oi_change, ema_val, a, last.close)
+    return IndicatorState(vol_ratio, taker_ratio, trend_dir, oi_change, ema_val,
+                          don_up, don_dn, a, last.close)
+
+
+def strength_score(state: IndicatorState, cfg: Optional[MonitoringConfig] = None) -> float:
+    """정렬 강도 합산점수(클수록 강함) — 알림 캡(상위 1~2) 선별용. *성적 아님, 정렬강도만.*
+
+    score = vol_ratio/vol_strong + taker강도/임계 + |OI|/oi_strong + 돌파폭/ATR.
+    각 항이 강한 임계에서 ≈1.0. 추세 None 이면 0.0.
+    """
+    cfg = cfg or MONITORING_CONFIG
+    d = state.trend_dir
+    if d is None:
+        return 0.0
+    vr = state.vol_ratio if state.vol_ratio is not None else 0.0
+    vol_s = vr / cfg.vol_mult_strong if cfg.vol_mult_strong > 0 else 0.0
+    tr = state.taker_ratio
+    if tr is None:
+        tak_s = 0.0
+    elif d == "LONG":
+        denom = cfg.taker_strong_long - 0.5
+        tak_s = (tr - 0.5) / denom if denom > 0 else 0.0
+    else:
+        denom = 0.5 - cfg.taker_strong_short
+        tak_s = (0.5 - tr) / denom if denom > 0 else 0.0
+    oi_s = (abs(state.oi_change_pct) / cfg.oi_change_strong) \
+        if (state.oi_change_pct is not None and cfg.oi_change_strong > 0) else 0.0
+    brk = 0.0
+    if state.atr_val > 0 and state.don_up is not None and state.don_dn is not None:
+        brk = ((state.close - state.don_up) / state.atr_val) if d == "LONG" \
+            else ((state.don_dn - state.close) / state.atr_val)
+        brk = max(0.0, brk)
+    return vol_s + max(0.0, tak_s) + oi_s + brk
 
 
 def classify(state: IndicatorState, cfg: Optional[MonitoringConfig] = None) -> Observation:

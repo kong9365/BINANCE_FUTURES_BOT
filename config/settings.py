@@ -460,11 +460,11 @@ class MonitoringConfig:
     donchian_period: int = 20
     atr_period: int = 14
     oi_lookback_min: int = 15
-    # STRONG(알림) 임계 — 4지표 전부 강한 정렬
-    vol_mult_strong: float = 2.0
+    # STRONG(알림) 임계 — 4지표 전부 강한 정렬. *빈도 5~6/일 목표로 상향*(성적 튜닝 아님).
+    vol_mult_strong: float = 2.5
     oi_change_strong: float = 5.0
-    taker_strong_long: float = 0.60
-    taker_strong_short: float = 0.40
+    taker_strong_long: float = 0.65
+    taker_strong_short: float = 0.35
     # WEAK(로그) 임계 — ≥3지표 완화 정렬
     vol_mult_weak: float = 1.5
     oi_change_weak: float = 3.0

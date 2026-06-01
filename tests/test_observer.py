@@ -85,6 +85,17 @@ def test_classify_none_when_no_trend():
     assert classify(st).grade == "NONE"
 
 
+def test_strength_score_ranks_alignment():
+    from monitoring.observer import strength_score
+    strong = compute_indicators(_bars(trend="up", last_vol_mult=3.0, last_taker=0.70),
+                                oi_now=110.0, oi_prev=100.0)
+    weaker = compute_indicators(_bars(trend="up", last_vol_mult=2.6, last_taker=0.66),
+                                oi_now=106.0, oi_prev=100.0)
+    s1, s2 = strength_score(strong), strength_score(weaker)
+    assert s1 > s2 > 0                                          # 더 강한 정렬 = 높은 점수
+    assert strength_score(compute_indicators(_bars(trend="ranging"))) == 0.0   # 추세없음=0
+
+
 def test_no_probability_field():
     """관찰 보고 — 방향확률/적중률 필드가 없어야 한다(가짜확률 금지)."""
     fields = {f.name for f in dataclasses.fields(Observation)}
