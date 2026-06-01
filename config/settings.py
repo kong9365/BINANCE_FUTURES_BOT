@@ -441,6 +441,55 @@ PROBE_CONFIG = ProbeConfig()
 
 
 # ─────────────────────────────────────────────────────
+# Monitoring — 실시간 관찰 알림 + 페이퍼 트레이딩 로그 (읽기전용·가상·HOLD)
+# 자동매매 아님 = *관찰 보고 + 손익구조 + 가상 로그*(6번째 검증). executor·실주문·실키 0.
+# 신호는 5회 무엣지로 확인된 그 신호들 → 페이퍼도 무엣지 예상. 전부 env override. 기본 OFF.
+# ─────────────────────────────────────────────────────
+def _resolve_mon_enabled() -> bool:
+    return (os.environ.get("MONITORING_ENABLED") or "").strip().lower() in ("1", "true", "yes")
+
+
+@dataclass
+class MonitoringConfig:
+    enabled: bool = field(default_factory=_resolve_mon_enabled)     # 기본 OFF(행동 변화 0)
+    scan_interval_s: int = 300                                       # 실시간 스캔 주기
+    interval: str = "15m"
+    # 지표 파라미터
+    vol_avg_bars: int = 20
+    ema_period: int = 200
+    donchian_period: int = 20
+    atr_period: int = 14
+    oi_lookback_min: int = 15
+    # STRONG(알림) 임계 — 4지표 전부 강한 정렬
+    vol_mult_strong: float = 2.0
+    oi_change_strong: float = 5.0
+    taker_strong_long: float = 0.60
+    taker_strong_short: float = 0.40
+    # WEAK(로그) 임계 — ≥3지표 완화 정렬
+    vol_mult_weak: float = 1.5
+    oi_change_weak: float = 3.0
+    taker_weak_long: float = 0.55
+    taker_weak_short: float = 0.45
+    # 알림 빈도 제어(원시 신호↓ → 실제 알림 1~2/일)
+    alert_daily_max: int = 2
+    alert_cooldown_h: int = 24
+    alert_min_interval_min: int = 30
+    # 손익구조/페이퍼(가상, 손실 0) — entry∓2ATR / entry±3ATR / 위험 0.5%
+    budget_usdt: float = field(default_factory=lambda: float(os.environ.get("MONITORING_BUDGET_USDT") or 200.0))
+    risk_pct: float = 0.005
+    atr_sl_mult: float = 2.0
+    atr_tp_mult: float = 3.0
+    time_stop_bars: int = 32
+    # 비용 모델(백테스트 post_only 일치): 진입 maker, 청산 taker + 슬리피지
+    maker_fee: float = 0.00018
+    taker_fee: float = 0.00045
+    slippage: float = 0.0010
+
+
+MONITORING_CONFIG = MonitoringConfig()
+
+
+# ─────────────────────────────────────────────────────
 # OIScanner (Layer 3 — OI 급증 후보 스캔)
 # ─────────────────────────────────────────────────────
 @dataclass
