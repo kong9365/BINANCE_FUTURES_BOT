@@ -21,13 +21,15 @@
 | `scripts/run_observer.py` | CLI 데몬 진입점. |
 | `dashboard/pages/7_paper_log.py` | 페이퍼 로그 대시보드 탭(평결박스·STRONG/WEAK·gross vs cost·누적곡선·n<200 배지). |
 
-## 가동 (운영자)
-1. **활성화**: `MONITORING_ENABLED=true`
-2. **(선택) Telegram 발신** — *운영자 본인이 직접* env 설정(CC는 실제 키 값 취급 0):
-   - `TELEGRAM_BOT_TOKEN=...`  `TELEGRAM_CHAT_ID=...`  (없으면 알림은 로그로만 남음)
+## 가동 (운영자) — 비밀 *값*은 운영자가 `.env` 에 직접 (CC 취급 0)
+`run_observer.py` 가 프로젝트 `.env` 를 자동 로드한다(`.env` 는 `.gitignore` → 커밋 안 됨).
+**운영자가 `.env` 에 아래를 직접 추가**(CC 는 키 값을 보지도 쓰지도 않음):
+1. **활성화(필수)**: `MONITORING_ENABLED=true`
+2. **(선택) Telegram 발신** — 본인이 직접: `TELEGRAM_BOT_TOKEN=<봇토큰>` · `TELEGRAM_CHAT_ID=<챗ID>` (없으면 알림은 로그로만).
+   - ※ **바이낸스 API 키는 불필요** — 시장데이터는 공개 keyless(`Client()`).
 3. **(선택) 조정**: `MONITORING_SYMBOLS=BNBUSDT,SOLUSDT,...` · `MONITORING_BUDGET_USDT=200` · `MONITORING_PAPER_DB=data/paper_log.db`
-4. **실행**: `python scripts/run_observer.py`  (테스트 `--cycles 1` 로 1회만)
-5. **대시보드**: `streamlit run dashboard/app.py` → "페이퍼 로그" 탭
+
+실행: `python scripts/run_observer.py` (테스트는 `--cycles 1`) · 대시보드: `streamlit run dashboard/app.py` → "페이퍼 로그" 탭
 
 ## 빈도 / 임계 (0단계 검증·승인 반영)
 - **알림(STRONG)**: 거래량≥2.5배 · |OI|≥5% · EMA200+Donchian20 정렬 · taker≥65%(롱)/≤35%(숏).

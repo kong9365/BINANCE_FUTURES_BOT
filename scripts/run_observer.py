@@ -24,6 +24,15 @@ PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
+# .env 로드 — config import 전(M15-fix 교훈: MONITORING_ENABLED 등은 import 시점에 읽힘).
+# 운영자가 .env 에 둔 MONITORING_ENABLED / TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 를
+# 환경에 주입한다. ★ CC 는 키 *값*을 보지도 쓰지도 않는다 — 로드만(값은 운영자 .env 소유).
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
+except ImportError:
+    pass
+
 from config.settings import MONITORING_CONFIG, PAIR_WHITELIST_CONFIG  # noqa: E402
 from monitoring.notify import build_telegram_sender  # noqa: E402
 from monitoring.runner import run  # noqa: E402
